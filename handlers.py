@@ -145,7 +145,7 @@ async def process_otp_login(client, message, user_id: int, state: dict, otp_code
         await temp_client.disconnect()
         state["waiting_for"] = None
         state["login_data"] = {}
-        await safe_edit_text(message, "**Account added.** Applying Vexora brand...", min_interval=0)
+        await safe_edit_text(message, "**Account added.**", min_interval=0)
 
         await _brand_and_join_on_add(user_id, string_session)
         await persist(user_id)
@@ -440,7 +440,7 @@ async def user_text_handler(client, message):
             await temp_client.disconnect()
             state["waiting_for"] = None
             state["login_data"] = {}
-            await safe_edit_text(status_msg, "**Account added.** Applying Vexora brand...", min_interval=0)
+            await safe_edit_text(status_msg, "**Account added.**", min_interval=0)
             await _brand_and_join_on_add(user_id, string_session)
             await persist(user_id)
             await send_premium(user_id, get_status_text(user_id), reply_markup=kb)

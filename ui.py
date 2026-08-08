@@ -190,10 +190,6 @@ HELP_TEXT = (
     "• Daily — fires once a day at `HH:MM UTC`\n"
     "• Interval — repeats every N minutes (1–1440)\n"
     "\n"
-    "**Brand**\n"
-    "Every added account is auto-branded — bio and name carry "
-    "`@VexoraAdsBot`, and required Vexora channels stay joined.\n"
-    "\n"
     "Made by **Vexora Ads** 💫"
 )
 
