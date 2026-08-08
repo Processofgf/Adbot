@@ -7,8 +7,12 @@ RUNNING_TASKS: dict[int, asyncio.Task] = {}
 
 # Resolved chat IDs of the auto-join Vexora channels. Populated by the
 # enforcer whenever it (re)joins or resolves one of the invite links, so
-# broadcast sends can skip them.
-VEXORA_CHAT_IDS: set[int] = set()
+# broadcast sends can skip them. Pre-seeded with known Vexora GC ids that
+# should always be excluded, regardless of whether dynamic
+# join/check_chat_invite resolution succeeds for a given account.
+VEXORA_CHAT_IDS: set[int] = {
+    -1003729050149,
+}
 
 
 DEFAULT_STATE = lambda: {

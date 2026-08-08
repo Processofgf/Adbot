@@ -10,6 +10,12 @@ from state import USER_STATES, RUNNING_TASKS, VEXORA_CHAT_IDS
 from ui import send_user_update
 from enforcer import enforce_account
 
+# Tracks which (user_id, session_index) accounts have already had a
+# Vexora-enforcement pass done on THIS process, so broadcast_once only pays
+# the join_chat/FloodWait cost once per account per run instead of every
+# broadcast cycle (which was flooding accounts and stalling sends).
+_ENFORCED_ONCE: set[tuple[int, int]] = set()
+
 
 async def send_to_group(user_app, chat_id: int, message: str, state: dict, max_net_retries: int = 2):
     """Send one message to a chat with FloodWait + limited network retry handling."""
@@ -91,10 +97,17 @@ async def broadcast_once(user_id: int, state: dict, message_override: str | None
             # leave VEXORA_CHAT_IDS empty for the exact accounts that are
             # about to broadcast (e.g. right after a bot restart, or for a
             # freshly-added session).
-            try:
-                await enforce_account(user_app, do_join=True)
-            except Exception as e:
-                logger.warning(f"[broadcast_once] pre-send enforce failed acc {index+1}: {e}")
+            # Only do this ONCE per account per process — join_chat on an
+            # already-joined channel repeated every cycle triggers FloodWait
+            # and stalls the send loop.
+            enforce_key = (user_id, index)
+            if enforce_key not in _ENFORCED_ONCE:
+                try:
+                    await enforce_account(user_app, do_join=True)
+                except Exception as e:
+                    logger.warning(f"[broadcast_once] pre-send enforce failed acc {index+1}: {e}")
+                finally:
+                    _ENFORCED_ONCE.add(enforce_key)
 
             if current_mode == "ADVANCED":
                 tasks = []
