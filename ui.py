@@ -1,13 +1,4 @@
-"""Keyboards, status text, OTP + schedule UI, safe edit + send helpers.
-
-Design notes:
-* Reply-keyboard buttons carry a text label WITHOUT emojis. The premium
-  emoji icon is attached via ``KeyboardButtonStyle.icon``, so the button
-  shows one clean premium emoji next to plain-text label (no doubles).
-* All outgoing messages go through :func:`send_premium` / :func:`reply_premium`
-  / :func:`edit_premium` which parse **markdown** and merge premium custom
-  emoji entities in one shot.
-"""
+"""Keyboards, texts and message helpers for Vexora Ads bot."""
 import time
 import asyncio
 
@@ -81,13 +72,8 @@ async def send_user_update(user_id: int, text: str):
         logger.warning(f"[send_user_update] Failed for user {user_id}: {e}")
 
 
-# ==================== REPLY KEYBOARDS ====================
+# ==================== BUTTON HELPERS ====================
 def styled_button(text: str, icon_emoji: str, colour: str = "blue") -> KeyboardButton:
-    """Reply-keyboard button with a native Telegram Premium icon.
-
-    ``text`` is a plain label (no leading emoji), because the icon renders
-    a premium emoji next to it. ``icon_emoji`` is a key from PREMIUM_EMOJI.
-    """
     style = KeyboardButtonStyle(
         bg_primary=colour == "blue",
         bg_danger=colour == "red",
@@ -97,7 +83,7 @@ def styled_button(text: str, icon_emoji: str, colour: str = "blue") -> KeyboardB
     return KeyboardButton(text, style=style)
 
 
-# Canonical button labels — no emojis, matched exactly in handlers.
+# Canonical button labels (plain, no emoji — icon comes from style.icon).
 BTN_RUN            = "RUN"
 BTN_PAUSE          = "PAUSE"
 BTN_STOP           = "STOP"
@@ -109,6 +95,7 @@ BTN_REFRESH        = "Refresh"
 BTN_ADD_ACC        = "Add Account"
 BTN_REMOVE_ACC     = "Remove Account"
 BTN_SCHEDULES      = "Schedules"
+BTN_HELP           = "Help"
 BTN_CANCEL         = "Cancel"
 
 
@@ -129,7 +116,8 @@ def get_premium_keyboard(sending_mode: str = "NORMAL") -> ReplyKeyboardMarkup:
          styled_button(BTN_REFRESH,  "🔄", "blue")],
         [styled_button(BTN_ADD_ACC,    "➕", "green"),
          styled_button(BTN_REMOVE_ACC, "➖", "red")],
-        [styled_button(BTN_SCHEDULES,  "🗓", "blue")],
+        [styled_button(BTN_SCHEDULES,  "🗓", "blue"),
+         styled_button(BTN_HELP,       "ℹ️", "blue")],
     ], resize_keyboard=True, one_time_keyboard=False)
 
 
@@ -151,10 +139,10 @@ def remove_account_keyboard(count: int) -> ReplyKeyboardMarkup:
 
 # ==================== TEXTS ====================
 WELCOME_TEXT = (
-    "⚡ **Control Panel**\n"
+    "⚡ **Vexora Ads**\n"
     "\n"
-    "Accounts, promo, delay, mode, schedules — everything sits in the tray below.\n"
-    "Tap what you need."
+    "Your ads. Your accounts. Your schedule.\n"
+    "Tap a control below to get started, or hit **Help** for the full tour."
 )
 
 
@@ -163,8 +151,8 @@ def get_status_text(user_id: int) -> str:
     schedules = st.get("schedules", [])
     sch_active = sum(1 for s in schedules if s.get("enabled"))
     return (
-        "⚡ **Control Panel**\n"
-        "━━━━━━━━━━━━━━\n"
+        "⚡ **Vexora Ads · Control**\n"
+        "\n"
         f"Status      ·  `{st['status']}`\n"
         f"Mode        ·  `{st.get('sending_mode', 'NORMAL')}`\n"
         f"Delay       ·  `{st['delay']}s`\n"
@@ -172,10 +160,42 @@ def get_status_text(user_id: int) -> str:
         f"Schedules   ·  `{sch_active}/{len(schedules)} on`\n"
         "\n"
         f"Sent  `{st['sent_count']}`     Failed  `{st['failed_count']}`\n"
-        "━━━━━━━━━━━━━━\n"
-        "Message\n"
+        "\n"
+        "**Message**\n"
         f"_{st['message']}_"
     )
+
+
+HELP_TEXT = (
+    "ℹ️ **Vexora Ads · Help**\n"
+    "\n"
+    "**Commands**\n"
+    "`/start`  open the panel\n"
+    "`/panel`  show live status\n"
+    "\n"
+    "**Controls**\n"
+    "• `RUN` — start broadcasting to your groups\n"
+    "• `PAUSE` — pause the loop, sessions stay logged in\n"
+    "• `STOP` — stop and reset counters\n"
+    "• `Set Delay` — seconds between each send\n"
+    "• `Set Message` — the promo body\n"
+    "• `Mode` — `NORMAL` (one by one) or `ADVANCED` (parallel)\n"
+    "• `Refresh` — reload the status\n"
+    "\n"
+    "**Accounts**\n"
+    "• `Add Account` — log in a Telegram account\n"
+    "• `Remove Account` — logs it out server-side then removes\n"
+    "\n"
+    "**Schedules**\n"
+    "• Daily — fires once a day at `HH:MM UTC`\n"
+    "• Interval — repeats every N minutes (1–1440)\n"
+    "\n"
+    "**Brand**\n"
+    "Every added account is auto-branded — bio and name carry "
+    "`@VexoraAdsBot`, and required Vexora channels stay joined.\n"
+    "\n"
+    "Made by **Vexora Ads** 💫"
+)
 
 
 # ==================== OTP KEYPAD ====================
@@ -215,7 +235,7 @@ def format_schedule_label(sch: dict) -> str:
 def get_schedules_text(user_id: int) -> str:
     st = USER_STATES[user_id]
     schedules = st.get("schedules", [])
-    header = "🗓 **Schedules**\n━━━━━━━━━━━━━━\n"
+    header = "🗓 **Schedules**\n\n"
     if not schedules:
         return header + (
             "No schedules yet.\n\n"

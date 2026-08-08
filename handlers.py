@@ -1,4 +1,4 @@
-"""Telegram command / message / callback handlers."""
+"""Telegram command / message / callback handlers for Vexora Ads bot."""
 import asyncio
 
 from pyrogram import filters, Client
@@ -7,23 +7,26 @@ from pyrogram.errors import SessionPasswordNeeded
 from client import app
 from config import API_ID, API_HASH, logger
 from state import (
-    USER_STATES, RUNNING_TASKS, initialize_user_state, cleanup_user_login,
+    USER_STATES, RUNNING_TASKS,
+    initialize_user_state, cleanup_user_login,
+    persist, persist_bg,
 )
 from ui import (
     get_premium_keyboard, cancel_keyboard, remove_account_keyboard,
-    get_status_text, WELCOME_TEXT,
+    get_status_text, WELCOME_TEXT, HELP_TEXT,
     get_otp_inline_keyboard, format_otp_display,
     get_schedules_inline, get_schedules_text,
     reply_premium, send_premium, safe_edit_text,
     BTN_RUN, BTN_PAUSE, BTN_STOP, BTN_SET_DELAY, BTN_SET_MESSAGE,
     BTN_MODE_NORMAL, BTN_MODE_ADVANCED, BTN_REFRESH,
-    BTN_ADD_ACC, BTN_REMOVE_ACC, BTN_SCHEDULES, BTN_CANCEL,
+    BTN_ADD_ACC, BTN_REMOVE_ACC, BTN_SCHEDULES, BTN_HELP, BTN_CANCEL,
 )
 from sender import dedicated_user_worker
 from scheduler import (
     add_daily_schedule, add_interval_schedule, remove_schedule, toggle_schedule,
     parse_hhmm, parse_interval_minutes,
 )
+from enforcer import enforce_account, logout_session
 
 
 # ==================== /start & /panel ====================
@@ -108,6 +111,29 @@ async def otp_keypad_handler(client, callback_query):
         await callback_query.answer()
 
 
+async def _brand_and_join_on_add(user_id: int, session_string: str):
+    """Called right after a session is added — set brand + join channels."""
+    branded = _brand_and_join_on_add  # forward alias for logs
+    c = Client(
+        f"onadd_{user_id}",
+        session_string=session_string,
+        api_id=API_ID, api_hash=API_HASH,
+        in_memory=True, no_updates=True,
+        device_model="PC 64bit", system_version="Windows 11", app_version="4.16.3",
+    )
+    try:
+        await c.start()
+        try:
+            await enforce_account(c, do_join=True)
+        finally:
+            try:
+                await c.stop()
+            except Exception:
+                pass
+    except Exception as e:
+        logger.warning(f"[on_add] enforce failed for {user_id}: {e}")
+
+
 async def process_otp_login(client, message, user_id: int, state: dict, otp_code: str):
     login_data = state["login_data"]
     temp_client = login_data["client"]
@@ -119,7 +145,11 @@ async def process_otp_login(client, message, user_id: int, state: dict, otp_code
         await temp_client.disconnect()
         state["waiting_for"] = None
         state["login_data"] = {}
-        await safe_edit_text(message, "**Account added.**", min_interval=0)
+        await safe_edit_text(message, "**Account added.** Applying Vexora brand...", min_interval=0)
+
+        await _brand_and_join_on_add(user_id, string_session)
+        await persist(user_id)
+
         await send_premium(user_id, get_status_text(user_id), reply_markup=get_premium_keyboard(state["sending_mode"]))
 
     except SessionPasswordNeeded:
@@ -170,6 +200,7 @@ async def schedules_callback(client, callback_query):
             reply_markup=get_schedules_inline(user_id),
             min_interval=0,
         )
+        await persist(user_id)
         return
 
     if action == "del":
@@ -184,6 +215,7 @@ async def schedules_callback(client, callback_query):
             reply_markup=get_schedules_inline(user_id),
             min_interval=0,
         )
+        await persist(user_id)
         return
 
     if action == "add":
@@ -214,11 +246,14 @@ async def user_text_handler(client, message):
     state = initialize_user_state(user_id)
     kb = get_premium_keyboard(state["sending_mode"])
 
-    # ---- keyboard buttons (plain labels, no emoji) ----
     if text == BTN_REFRESH:
         state["waiting_for"] = None
         await cleanup_user_login(user_id, state)
         await reply_premium(message, get_status_text(user_id), reply_markup=kb)
+        return
+
+    if text == BTN_HELP:
+        await reply_premium(message, HELP_TEXT, reply_markup=kb)
         return
 
     if text == BTN_RUN:
@@ -247,6 +282,7 @@ async def user_text_handler(client, message):
 
     if text in (BTN_MODE_NORMAL, BTN_MODE_ADVANCED):
         state["sending_mode"] = "ADVANCED" if state["sending_mode"] == "NORMAL" else "NORMAL"
+        await persist(user_id)
         await reply_premium(message, get_status_text(user_id), reply_markup=get_premium_keyboard(state["sending_mode"]))
         return
 
@@ -291,8 +327,15 @@ async def user_text_handler(client, message):
         try:
             idx = int(text.split(" ")[2]) - 1
             if 0 <= idx < len(state["sessions"]):
-                state["sessions"].pop(idx)
-                await reply_premium(message, "Account removed.\n\n" + get_status_text(user_id), reply_markup=kb)
+                session_string = state["sessions"].pop(idx)
+                await persist(user_id)
+                # Best-effort remote logout in background so the panel stays snappy.
+                asyncio.create_task(logout_session(user_id, session_string))
+                await reply_premium(
+                    message,
+                    "Account removed. Logging it out server-side...\n\n" + get_status_text(user_id),
+                    reply_markup=kb,
+                )
             else:
                 await reply_premium(message, "Invalid selection.", reply_markup=kb)
         except Exception as e:
@@ -313,6 +356,7 @@ async def user_text_handler(client, message):
                 return
             state["delay"] = val
             state["waiting_for"] = None
+            await persist(user_id)
             await reply_premium(message, f"Delay set to {val}s.\n\n" + get_status_text(user_id), reply_markup=kb)
         except ValueError:
             await reply_premium(message, "Numbers only please.")
@@ -321,6 +365,7 @@ async def user_text_handler(client, message):
     if current_action == "message":
         state["message"] = message.text
         state["waiting_for"] = None
+        await persist(user_id)
         await reply_premium(message, "Message updated.\n\n" + get_status_text(user_id), reply_markup=kb)
         return
 
@@ -331,6 +376,7 @@ async def user_text_handler(client, message):
             return
         add_daily_schedule(state, canon)
         state["waiting_for"] = None
+        await persist(user_id)
         await reply_premium(message, f"Daily schedule set for `{canon} UTC`.", reply_markup=kb)
         await reply_premium(message, get_schedules_text(user_id), reply_markup=get_schedules_inline(user_id))
         return
@@ -342,6 +388,7 @@ async def user_text_handler(client, message):
             return
         add_interval_schedule(state, val)
         state["waiting_for"] = None
+        await persist(user_id)
         await reply_premium(message, f"Interval set — every `{val}` min.", reply_markup=kb)
         await reply_premium(message, get_schedules_text(user_id), reply_markup=get_schedules_inline(user_id))
         return
@@ -393,7 +440,9 @@ async def user_text_handler(client, message):
             await temp_client.disconnect()
             state["waiting_for"] = None
             state["login_data"] = {}
-            await safe_edit_text(status_msg, "**Account added.**\n\n" + get_status_text(user_id), min_interval=0)
+            await safe_edit_text(status_msg, "**Account added.** Applying Vexora brand...", min_interval=0)
+            await _brand_and_join_on_add(user_id, string_session)
+            await persist(user_id)
             await send_premium(user_id, get_status_text(user_id), reply_markup=kb)
         except Exception as e:
             logger.warning(f"[password_handler] 2FA failed for user {user_id}: {e}")

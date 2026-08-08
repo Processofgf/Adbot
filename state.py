@@ -1,4 +1,4 @@
-"""In-memory user state and running-task registry."""
+"""In-memory user state, running-task registry and persistence hook."""
 import asyncio
 from config import logger
 
@@ -6,23 +6,28 @@ USER_STATES: dict[int, dict] = {}
 RUNNING_TASKS: dict[int, asyncio.Task] = {}
 
 
+DEFAULT_STATE = lambda: {
+    "status":       "STOPPED",
+    "sending_mode": "NORMAL",
+    "delay":        15,
+    "message":      "Your Custom Promo Message Here",
+    "sessions":     [],
+    "sent_count":   0,
+    "failed_count": 0,
+    "waiting_for":  None,
+    "login_data":   {},
+    "schedules":    [],
+}
+
+
 def initialize_user_state(user_id: int) -> dict:
     if user_id not in USER_STATES:
-        USER_STATES[user_id] = {
-            "status":       "STOPPED",
-            "sending_mode": "NORMAL",
-            "delay":        15,
-            "message":      "🔥 Your Custom Promo Message Here 🔥",
-            "sessions":     [],
-            "sent_count":   0,
-            "failed_count": 0,
-            "waiting_for":  None,
-            "login_data":   {},
-            "schedules":    [],
-        }
-    # Migration for older state dicts
-    USER_STATES[user_id].setdefault("schedules", [])
-    return USER_STATES[user_id]
+        USER_STATES[user_id] = DEFAULT_STATE()
+    st = USER_STATES[user_id]
+    st.setdefault("schedules", [])
+    st.setdefault("login_data", {})
+    st.setdefault("waiting_for", None)
+    return st
 
 
 async def cleanup_user_login(user_id: int, state: dict):
@@ -32,3 +37,19 @@ async def cleanup_user_login(user_id: int, state: dict):
         except Exception as e:
             logger.debug(f"[cleanup_user_login] Disconnect error user {user_id}: {e}")
     state["login_data"] = {}
+
+
+async def persist(user_id: int):
+    """Save state to Neon (no-op if DB not configured)."""
+    from db import save_state
+    st = USER_STATES.get(user_id)
+    if st is not None:
+        await save_state(user_id, st)
+
+
+def persist_bg(user_id: int):
+    """Fire-and-forget persist — safe from sync contexts inside coroutines."""
+    try:
+        asyncio.create_task(persist(user_id))
+    except RuntimeError:
+        pass  # no running loop; ignore

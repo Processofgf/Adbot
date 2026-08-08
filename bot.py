@@ -1,37 +1,35 @@
-"""MultiControlBot — entrypoint.
+"""Vexora Ads Bot — entrypoint.
 
-Modules:
-  config      env, logging, PREMIUM_EMOJI map
-  premium     custom-emoji MessageEntity helpers
-  client      shared Pyrogram Client singleton
-  state       USER_STATES, RUNNING_TASKS, init & cleanup
-  ui          keyboards, status text, OTP + schedules UI, safe_edit_text
-  sender      broadcast_once, dedicated_user_worker, run_scheduled_broadcast
-  scheduler   daily / interval schedule engine
-  handlers    all /start, keyboard, callback handlers (registered on import)
+Boots the Pyrogram Client, wires handlers, connects to Neon Postgres
+(optional), loads persisted user state, then launches the scheduler and
+brand-enforcer background loops.
 """
 import asyncio
 
 from config import logger
 from client import app
 import handlers  # noqa: F401  — registers @app.on_message / @app.on_callback_query
+from state import USER_STATES
 from scheduler import scheduler_loop
+from enforcer import enforcer_loop
+import db
 
 
-async def _startup(_client):
-    logger.info("🚀 Bot Engine Starting...")
+async def _bootstrap():
+    logger.info("Vexora Ads Bot starting...")
+    await db.init_db()
+    loaded = await db.load_all()
+    if loaded:
+        USER_STATES.update(loaded)
+    await app.start()
     asyncio.create_task(scheduler_loop())
+    asyncio.create_task(enforcer_loop())
+    logger.info("Vexora Ads Bot online.")
+    await asyncio.Event().wait()
 
 
 if __name__ == "__main__":
-    # Start scheduler once the Client loop is ready.
-    async def _main():
-        await app.start()
-        await _startup(app)
-        logger.info("✅ Bot online.")
-        await asyncio.Event().wait()
-
     try:
-        app.run(_main())
+        app.run(_bootstrap())
     except KeyboardInterrupt:
         logger.info("Bot stopped.")
