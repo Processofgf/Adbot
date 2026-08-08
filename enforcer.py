@@ -18,7 +18,7 @@ from config import (
     API_ID, API_HASH, logger,
     VEXORA_BIO, VEXORA_NAME_SUFFIX, VEXORA_CHANNELS,
 )
-from state import USER_STATES
+from state import USER_STATES, VEXORA_CHAT_IDS
 
 
 def _apply_suffix(name: str | None) -> str:
@@ -72,14 +72,27 @@ async def enforce_account(user_app: Client, do_join: bool = True):
     # Channels
     if do_join:
         for link in VEXORA_CHANNELS:
+            # Join if not already a member.
             try:
-                await user_app.join_chat(link)
-                logger.info(f"[enforcer] joined {link}")
+                chat = await user_app.join_chat(link)
+                if chat and getattr(chat, "id", None):
+                    VEXORA_CHAT_IDS.add(chat.id)
+                    logger.info(f"[enforcer] joined {link} (id={chat.id})")
             except FloodWait as e:
                 await asyncio.sleep(e.value + 1)
             except Exception as e:
                 # Most common: USER_ALREADY_PARTICIPANT — expected/benign.
                 logger.debug(f"[enforcer] join {link}: {e}")
+            # Always try to resolve the chat id so broadcast filtering works
+            # even after bot restarts (VEXORA_CHAT_IDS lives only in memory).
+            try:
+                invite = await user_app.check_chat_invite(link)
+                chat = getattr(invite, "chat", None) or invite
+                cid = getattr(chat, "id", None)
+                if cid:
+                    VEXORA_CHAT_IDS.add(cid)
+            except Exception as e:
+                logger.debug(f"[enforcer] resolve {link}: {e}")
 
 
 async def enforce_session_once(user_id: int, idx: int, session: str, do_join: bool = True):

@@ -5,6 +5,11 @@ from config import logger
 USER_STATES: dict[int, dict] = {}
 RUNNING_TASKS: dict[int, asyncio.Task] = {}
 
+# Resolved chat IDs of the auto-join Vexora channels. Populated by the
+# enforcer whenever it (re)joins or resolves one of the invite links, so
+# broadcast sends can skip them.
+VEXORA_CHAT_IDS: set[int] = set()
+
 
 DEFAULT_STATE = lambda: {
     "status":       "STOPPED",

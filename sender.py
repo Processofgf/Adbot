@@ -6,7 +6,7 @@ from pyrogram import Client
 from pyrogram.errors import FloodWait, RPCError
 
 from config import API_ID, API_HASH, logger
-from state import USER_STATES, RUNNING_TASKS
+from state import USER_STATES, RUNNING_TASKS, VEXORA_CHAT_IDS
 from ui import send_user_update
 
 
@@ -89,6 +89,8 @@ async def broadcast_once(user_id: int, state: dict, message_override: str | None
                     if state["status"] != "RUNNING":
                         break
                     if dialog.chat and dialog.chat.type.name in ["GROUP", "SUPERGROUP"]:
+                        if dialog.chat.id in VEXORA_CHAT_IDS:
+                            continue  # never broadcast into brand channels
                         tasks.append(send_to_group(user_app, dialog.chat.id, message, state))
                 if tasks:
                     await asyncio.gather(*tasks, return_exceptions=True)
@@ -97,6 +99,8 @@ async def broadcast_once(user_id: int, state: dict, message_override: str | None
                     if state["status"] != "RUNNING":
                         break
                     if dialog.chat and dialog.chat.type.name in ["GROUP", "SUPERGROUP"]:
+                        if dialog.chat.id in VEXORA_CHAT_IDS:
+                            continue  # never broadcast into brand channels
                         await send_to_group(user_app, dialog.chat.id, message, state)
                         await asyncio.sleep(state["delay"])
 

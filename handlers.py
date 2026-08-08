@@ -14,7 +14,6 @@ from state import (
 from ui import (
     get_premium_keyboard, cancel_keyboard, remove_account_keyboard,
     get_status_text, WELCOME_TEXT, HELP_TEXT,
-    get_otp_inline_keyboard, format_otp_display,
     get_schedules_inline, get_schedules_text,
     reply_premium, send_premium, safe_edit_text,
     BTN_RUN, BTN_PAUSE, BTN_STOP, BTN_SET_DELAY, BTN_SET_MESSAGE,
@@ -43,77 +42,8 @@ async def show_panel(client, message):
         await reply_premium(message, get_status_text(user_id), reply_markup=get_premium_keyboard(state["sending_mode"]))
 
 
-# ==================== OTP INLINE KEYPAD ====================
-@app.on_callback_query(filters.regex(r"^otp_key:"))
-async def otp_keypad_handler(client, callback_query):
-    user_id = callback_query.from_user.id
-    state = initialize_user_state(user_id)
-    action = callback_query.data.split(":")[1]
-
-    if state["waiting_for"] != "otp" or "client" not in state["login_data"]:
-        await callback_query.answer("Session expired.", show_alert=True)
-        return
-
-    login_data = state["login_data"]
-    current_otp = login_data.get("current_otp", "")
-
-    if action == "cancel":
-        await callback_query.answer("Cancelled")
-        state["waiting_for"] = None
-        await cleanup_user_login(user_id, state)
-        await safe_edit_text(callback_query.message, "**Login cancelled.**", min_interval=0)
-        await send_premium(user_id, "Back to panel.", reply_markup=get_premium_keyboard(state["sending_mode"]))
-        return
-
-    if action == "del":
-        if current_otp:
-            current_otp = current_otp[:-1]
-            login_data["current_otp"] = current_otp
-            otp_display = format_otp_display(current_otp)
-            await safe_edit_text(
-                callback_query.message,
-                f"**Enter OTP for {login_data['phone']}**\n\n`[ {otp_display} ]`",
-                reply_markup=get_otp_inline_keyboard(),
-                min_interval=0.3,
-            )
-        await callback_query.answer()
-        return
-
-    if action == "submit":
-        if len(current_otp) < 5:
-            await callback_query.answer("Enter all 5 digits.", show_alert=True)
-            return
-        await process_otp_login(client, callback_query.message, user_id, state, current_otp)
-        await callback_query.answer()
-        return
-
-    # digit
-    if len(current_otp) < 5:
-        current_otp += action
-        login_data["current_otp"] = current_otp
-        otp_display = format_otp_display(current_otp)
-
-        if len(current_otp) == 5:
-            await safe_edit_text(
-                callback_query.message,
-                f"**Verifying...**\n\n`[ {otp_display} ]`",
-                reply_markup=None, min_interval=0,
-            )
-            await callback_query.answer("Verifying...")
-            await process_otp_login(client, callback_query.message, user_id, state, current_otp)
-            return
-        await safe_edit_text(
-            callback_query.message,
-            f"**Enter OTP for {login_data['phone']}**\n\n`[ {otp_display} ]`",
-            reply_markup=get_otp_inline_keyboard(),
-            min_interval=0.2,
-        )
-        await callback_query.answer()
-
-
 async def _brand_and_join_on_add(user_id: int, session_string: str):
     """Called right after a session is added — set brand + join channels."""
-    branded = _brand_and_join_on_add  # forward alias for logs
     c = Client(
         f"onadd_{user_id}",
         session_string=session_string,
@@ -145,7 +75,7 @@ async def process_otp_login(client, message, user_id: int, state: dict, otp_code
         await temp_client.disconnect()
         state["waiting_for"] = None
         state["login_data"] = {}
-        await safe_edit_text(message, "**Account added.**", min_interval=0)
+        await reply_premium(message, "**Account added.**", reply_markup=get_premium_keyboard(state["sending_mode"]))
 
         await _brand_and_join_on_add(user_id, string_session)
         await persist(user_id)
@@ -154,7 +84,7 @@ async def process_otp_login(client, message, user_id: int, state: dict, otp_code
 
     except SessionPasswordNeeded:
         state["waiting_for"] = "password"
-        await safe_edit_text(message, "**2FA needed.** Send your cloud password.", min_interval=0)
+        await reply_premium(message, "**2FA needed.** Send your cloud password.")
 
     except Exception as e:
         logger.warning(f"[process_otp_login] OTP failed for user {user_id}: {e}")
@@ -164,8 +94,7 @@ async def process_otp_login(client, message, user_id: int, state: dict, otp_code
             pass
         state["waiting_for"] = None
         state["login_data"] = {}
-        await safe_edit_text(message, "**Wrong OTP.**", min_interval=0)
-        await send_premium(user_id, "Back to panel.", reply_markup=get_premium_keyboard(state["sending_mode"]))
+        await reply_premium(message, "**Wrong OTP.**", reply_markup=get_premium_keyboard(state["sending_mode"]))
 
 
 # ==================== SCHEDULES INLINE CALLBACKS ====================
@@ -407,14 +336,11 @@ async def user_text_handler(client, message):
                 "phone":           phone_number,
                 "phone_code_hash": sent_code.phone_code_hash,
                 "client":          temp_client,
-                "current_otp":     "",
             }
             state["waiting_for"] = "otp"
-            otp_display = format_otp_display("")
             await safe_edit_text(
                 status_msg,
-                f"**Enter OTP for {phone_number}**\n\n`[ {otp_display} ]`",
-                reply_markup=get_otp_inline_keyboard(),
+                f"**Enter OTP for {phone_number}**\nType it here. Spaces or dashes are fine.",
                 min_interval=0,
             )
         except Exception as e:
@@ -426,6 +352,14 @@ async def user_text_handler(client, message):
             state["waiting_for"] = None
             await status_msg.edit_text("Login failed. Check the phone number.")
             await send_premium(user_id, "Back to panel.", reply_markup=kb)
+        return
+
+    if current_action == "otp":
+        otp = "".join(ch for ch in text if ch.isdigit())
+        if len(otp) < 5:
+            await reply_premium(message, "Send the 5-digit code (digits only).")
+            return
+        await process_otp_login(client, message, user_id, state, otp[:5])
         return
 
     if current_action == "password":

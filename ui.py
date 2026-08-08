@@ -194,32 +194,6 @@ HELP_TEXT = (
 )
 
 
-# ==================== OTP KEYPAD ====================
-def get_otp_inline_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("1", callback_data="otp_key:1"),
-         InlineKeyboardButton("2", callback_data="otp_key:2"),
-         InlineKeyboardButton("3", callback_data="otp_key:3")],
-        [InlineKeyboardButton("4", callback_data="otp_key:4"),
-         InlineKeyboardButton("5", callback_data="otp_key:5"),
-         InlineKeyboardButton("6", callback_data="otp_key:6")],
-        [InlineKeyboardButton("7", callback_data="otp_key:7"),
-         InlineKeyboardButton("8", callback_data="otp_key:8"),
-         InlineKeyboardButton("9", callback_data="otp_key:9")],
-        [InlineKeyboardButton("Del",    callback_data="otp_key:del"),
-         InlineKeyboardButton("0",      callback_data="otp_key:0"),
-         InlineKeyboardButton("Submit", callback_data="otp_key:submit")],
-        [InlineKeyboardButton("Cancel", callback_data="otp_key:cancel")],
-    ])
-
-
-def format_otp_display(current_otp: str, total_slots: int = 5) -> str:
-    chars = []
-    for i in range(total_slots):
-        chars.append(f"**{current_otp[i]}**" if i < len(current_otp) else "**_**")
-    return "  ".join(chars)
-
-
 # ==================== SCHEDULES UI ====================
 def format_schedule_label(sch: dict) -> str:
     dot = "on" if sch.get("enabled") else "off"
