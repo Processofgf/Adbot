@@ -19,7 +19,7 @@ def premium_entities(text: str):
                 type=MessageEntityType.CUSTOM_EMOJI,
                 offset=len(prefix) // 2,
                 length=len(length) // 2,
-                custom_emoji_id=custom_id,
+                custom_emoji_id=int(custom_id),
             ))
             start = index + len(emoji)
     return entities
