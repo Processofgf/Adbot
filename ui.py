@@ -1,4 +1,13 @@
-"""Keyboards, status text, safe edit, OTP helpers — all user-facing UI."""
+"""Keyboards, status text, OTP + schedule UI, safe edit + send helpers.
+
+Design notes:
+* Reply-keyboard buttons carry a text label WITHOUT emojis. The premium
+  emoji icon is attached via ``KeyboardButtonStyle.icon``, so the button
+  shows one clean premium emoji next to plain-text label (no doubles).
+* All outgoing messages go through :func:`send_premium` / :func:`reply_premium`
+  / :func:`edit_premium` which parse **markdown** and merge premium custom
+  emoji entities in one shot.
+"""
 import time
 import asyncio
 
@@ -9,35 +18,51 @@ from pyrogram.types import (
 from pyrogram.errors import FloodWait, MessageNotModified, RPCError
 
 from config import PREMIUM_EMOJI, logger
-from premium import premium_kwargs
+from premium import build_message
 from client import app
 from state import USER_STATES
 
+
+# ==================== SEND HELPERS ====================
+async def reply_premium(message, text: str, reply_markup=None):
+    body, ents = await build_message(text)
+    return await message.reply_text(body, reply_markup=reply_markup, entities=ents)
+
+
+async def send_premium(chat_id: int, text: str, reply_markup=None):
+    body, ents = await build_message(text)
+    return await app.send_message(chat_id, body, reply_markup=reply_markup, entities=ents)
+
+
+async def edit_premium(message, text: str, reply_markup=None):
+    body, ents = await build_message(text)
+    return await message.edit_text(body, reply_markup=reply_markup, entities=ents)
+
+
+# ==================== SAFE EDIT ====================
 _last_edits: dict = {}
 
 
-# ==================== SAFE MESSAGE EDIT ====================
-async def safe_edit_text(message, text, reply_markup=None, parse_mode=None, min_interval: float = 2.5):
+async def safe_edit_text(message, text: str, reply_markup=None, min_interval: float = 2.5):
     if not message:
         return
     msg_key = (message.chat.id, message.id)
     now = time.time()
     if msg_key in _last_edits and (now - _last_edits[msg_key]) < min_interval:
         return
-    # Prune stale entries to avoid unbounded growth
     if len(_last_edits) > 500:
         cutoff = now - 300
         stale = [k for k, v in _last_edits.items() if v < cutoff]
         for k in stale:
             del _last_edits[k]
     try:
-        await message.edit_text(text, reply_markup=reply_markup, parse_mode=parse_mode, **premium_kwargs(text))
+        await edit_premium(message, text, reply_markup=reply_markup)
         _last_edits[msg_key] = time.time()
     except FloodWait as e:
         if e.value <= 10:
             await asyncio.sleep(e.value)
             try:
-                await message.edit_text(text, reply_markup=reply_markup, parse_mode=parse_mode, **premium_kwargs(text))
+                await edit_premium(message, text, reply_markup=reply_markup)
                 _last_edits[msg_key] = time.time()
             except Exception as inner_e:
                 logger.debug(f"[safe_edit_text] retry after FloodWait failed: {inner_e}")
@@ -51,61 +76,105 @@ async def safe_edit_text(message, text, reply_markup=None, parse_mode=None, min_
 
 async def send_user_update(user_id: int, text: str):
     try:
-        await app.send_message(user_id, text, **premium_kwargs(text))
+        await send_premium(user_id, text)
     except Exception as e:
         logger.warning(f"[send_user_update] Failed for user {user_id}: {e}")
 
 
 # ==================== REPLY KEYBOARDS ====================
-def styled_button(text: str, custom_id: str, colour: str = "blue") -> KeyboardButton:
+def styled_button(text: str, icon_emoji: str, colour: str = "blue") -> KeyboardButton:
+    """Reply-keyboard button with a native Telegram Premium icon.
+
+    ``text`` is a plain label (no leading emoji), because the icon renders
+    a premium emoji next to it. ``icon_emoji`` is a key from PREMIUM_EMOJI.
+    """
     style = KeyboardButtonStyle(
         bg_primary=colour == "blue",
         bg_danger=colour == "red",
         bg_success=colour == "green",
-        icon=int(custom_id),
+        icon=int(PREMIUM_EMOJI[icon_emoji]),
     )
     return KeyboardButton(text, style=style)
 
 
+# Canonical button labels — no emojis, matched exactly in handlers.
+BTN_RUN            = "RUN"
+BTN_PAUSE          = "PAUSE"
+BTN_STOP           = "STOP"
+BTN_SET_DELAY      = "Set Delay"
+BTN_SET_MESSAGE    = "Set Message"
+BTN_MODE_NORMAL    = "Mode: NORMAL"
+BTN_MODE_ADVANCED  = "Mode: ADVANCED"
+BTN_REFRESH        = "Refresh"
+BTN_ADD_ACC        = "Add Account"
+BTN_REMOVE_ACC     = "Remove Account"
+BTN_SCHEDULES      = "Schedules"
+BTN_CANCEL         = "Cancel"
+
+
 def get_premium_keyboard(sending_mode: str = "NORMAL") -> ReplyKeyboardMarkup:
-    mode_text = "🚀 Mode: ADVANCED" if sending_mode == "ADVANCED" else "🐢 Mode: NORMAL"
+    if sending_mode == "ADVANCED":
+        mode_label = BTN_MODE_ADVANCED
+        mode_icon = "🚀"
+    else:
+        mode_label = BTN_MODE_NORMAL
+        mode_icon = "🐢"
     return ReplyKeyboardMarkup([
-        [styled_button("▶️ RUN", PREMIUM_EMOJI["▶️"], "green"),
-         styled_button("⏸️ PAUSE", PREMIUM_EMOJI["⏸️"], "blue"),
-         styled_button("⏹️ STOP", PREMIUM_EMOJI["⏹️"], "red")],
-        [styled_button("⏱️ Set Delay", PREMIUM_EMOJI["⏱️"], "blue"),
-         styled_button("📝 Set Message", PREMIUM_EMOJI["📝"], "blue")],
-        [styled_button(mode_text, PREMIUM_EMOJI["🚀" if sending_mode == "ADVANCED" else "🐢"], "blue"),
-         styled_button("🔄 Refresh Status", PREMIUM_EMOJI["🔄"], "blue")],
-        [styled_button("➕ Add Account", PREMIUM_EMOJI["➕"], "green"),
-         styled_button("➖ Remove Account", PREMIUM_EMOJI["➖"], "red")],
-        [styled_button("🗓 Schedules", PREMIUM_EMOJI["🗓"], "blue")],
+        [styled_button(BTN_RUN,      "▶️", "green"),
+         styled_button(BTN_PAUSE,    "⏸️", "blue"),
+         styled_button(BTN_STOP,     "⏹️", "red")],
+        [styled_button(BTN_SET_DELAY,   "⏱️", "blue"),
+         styled_button(BTN_SET_MESSAGE, "📝", "blue")],
+        [styled_button(mode_label,   mode_icon, "blue"),
+         styled_button(BTN_REFRESH,  "🔄", "blue")],
+        [styled_button(BTN_ADD_ACC,    "➕", "green"),
+         styled_button(BTN_REMOVE_ACC, "➖", "red")],
+        [styled_button(BTN_SCHEDULES,  "🗓", "blue")],
     ], resize_keyboard=True, one_time_keyboard=False)
 
 
 def cancel_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
-        [[styled_button("🔙 Cancel Operational Mode", PREMIUM_EMOJI["🔙"], "blue")]],
+        [[styled_button(BTN_CANCEL, "🔙", "blue")]],
         resize_keyboard=True,
     )
 
 
-# ==================== STATUS TEXT ====================
+def remove_account_keyboard(count: int) -> ReplyKeyboardMarkup:
+    rows = [
+        [styled_button(f"Remove Profile {i+1}", "❌", "red")]
+        for i in range(count)
+    ]
+    rows.append([styled_button(BTN_CANCEL, "🔙", "blue")])
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
+
+
+# ==================== TEXTS ====================
+WELCOME_TEXT = (
+    "⚡ **Control Panel**\n"
+    "\n"
+    "Accounts, promo, delay, mode, schedules — everything sits in the tray below.\n"
+    "Tap what you need."
+)
+
+
 def get_status_text(user_id: int) -> str:
-    state = USER_STATES[user_id]
-    schedules = state.get("schedules", [])
+    st = USER_STATES[user_id]
+    schedules = st.get("schedules", [])
     sch_active = sum(1 for s in schedules if s.get("enabled"))
     return (
-        f"⚡ **CONTROL ROOM** ⚡\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"📊 **Status**  ·  `{state['status']}`\n"
-        f"⚙️ **Mode**  ·  `{state.get('sending_mode', 'NORMAL')}`\n"
-        f"⏱️ **Delay**  ·  `{state['delay']} sec`\n"
-        f"👥 **Accounts**  ·  `{len(state['sessions'])}`\n"
-        f"🗓 **Schedules**  ·  `{sch_active}/{len(schedules)} active`\n\n"
-        f"✅ **Sent**  `{state['sent_count']}`     ❌ **Failed**  `{state['failed_count']}`\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"💬 **Current promo message**\n_{state['message']}_"
+        "⚡ **Control Panel**\n"
+        "━━━━━━━━━━━━━━\n"
+        f"Status      ·  `{st['status']}`\n"
+        f"Mode        ·  `{st.get('sending_mode', 'NORMAL')}`\n"
+        f"Delay       ·  `{st['delay']}s`\n"
+        f"Accounts    ·  `{len(st['sessions'])}`\n"
+        f"Schedules   ·  `{sch_active}/{len(schedules)} on`\n"
+        "\n"
+        f"Sent  `{st['sent_count']}`     Failed  `{st['failed_count']}`\n"
+        "━━━━━━━━━━━━━━\n"
+        "Message\n"
+        f"_{st['message']}_"
     )
 
 
@@ -121,10 +190,10 @@ def get_otp_inline_keyboard():
         [InlineKeyboardButton("7", callback_data="otp_key:7"),
          InlineKeyboardButton("8", callback_data="otp_key:8"),
          InlineKeyboardButton("9", callback_data="otp_key:9")],
-        [InlineKeyboardButton("⌫ Delete", callback_data="otp_key:del"),
-         InlineKeyboardButton("0",         callback_data="otp_key:0"),
-         InlineKeyboardButton("✅ Submit",  callback_data="otp_key:submit")],
-        [InlineKeyboardButton("❌ Cancel Login", callback_data="otp_key:cancel")],
+        [InlineKeyboardButton("Del",    callback_data="otp_key:del"),
+         InlineKeyboardButton("0",      callback_data="otp_key:0"),
+         InlineKeyboardButton("Submit", callback_data="otp_key:submit")],
+        [InlineKeyboardButton("Cancel", callback_data="otp_key:cancel")],
     ])
 
 
@@ -137,47 +206,38 @@ def format_otp_display(current_otp: str, total_slots: int = 5) -> str:
 
 # ==================== SCHEDULES UI ====================
 def format_schedule_label(sch: dict) -> str:
-    dot = "🟢" if sch.get("enabled") else "⏸️"
+    dot = "on" if sch.get("enabled") else "off"
     if sch["kind"] == "daily":
-        base = f"{dot} Daily · {sch['time']} UTC"
-    else:
-        base = f"{dot} Every {sch['interval_minutes']} min"
-    if sch.get("message"):
-        base += "  ✎"
-    return base
+        return f"[{dot}] Daily · {sch['time']} UTC"
+    return f"[{dot}] Every {sch['interval_minutes']} min"
 
 
 def get_schedules_text(user_id: int) -> str:
-    state = USER_STATES[user_id]
-    schedules = state.get("schedules", [])
-    header = (
-        "🗓 **Broadcast Schedules**\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-    )
+    st = USER_STATES[user_id]
+    schedules = st.get("schedules", [])
+    header = "🗓 **Schedules**\n━━━━━━━━━━━━━━\n"
     if not schedules:
         return header + (
-            "_No schedules yet._\n\n"
-            "• **Daily** — fires once every 24h at a fixed UTC time.\n"
-            "• **Interval** — repeats every N minutes.\n\n"
-            "Use the buttons below to add one."
+            "No schedules yet.\n\n"
+            "• Daily — fires once a day at fixed UTC time.\n"
+            "• Interval — repeats every N minutes.\n\n"
+            "Add one below."
         )
-    return header + (
-        f"_{len(schedules)} configured. Tap ⏸️/▶️ to toggle or 🗑 to remove._"
-    )
+    return header + f"{len(schedules)} configured. Toggle or remove below."
 
 
 def get_schedules_inline(user_id: int) -> InlineKeyboardMarkup:
-    state = USER_STATES[user_id]
+    st = USER_STATES[user_id]
     buttons = []
-    for sch in state.get("schedules", []):
+    for sch in st.get("schedules", []):
         buttons.append([
             InlineKeyboardButton(format_schedule_label(sch), callback_data=f"sch:noop:{sch['id']}"),
-            InlineKeyboardButton("⏸️" if sch.get("enabled") else "▶️", callback_data=f"sch:toggle:{sch['id']}"),
-            InlineKeyboardButton("🗑", callback_data=f"sch:del:{sch['id']}"),
+            InlineKeyboardButton("Pause" if sch.get("enabled") else "Run", callback_data=f"sch:toggle:{sch['id']}"),
+            InlineKeyboardButton("Del", callback_data=f"sch:del:{sch['id']}"),
         ])
     buttons.append([
-        InlineKeyboardButton("➕ Add Daily", callback_data="sch:add:daily"),
-        InlineKeyboardButton("➕ Add Interval", callback_data="sch:add:interval"),
+        InlineKeyboardButton("Add Daily",    callback_data="sch:add:daily"),
+        InlineKeyboardButton("Add Interval", callback_data="sch:add:interval"),
     ])
-    buttons.append([InlineKeyboardButton("🔙 Close", callback_data="sch:close")])
+    buttons.append([InlineKeyboardButton("Close", callback_data="sch:close")])
     return InlineKeyboardMarkup(buttons)

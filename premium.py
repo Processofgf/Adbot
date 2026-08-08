@@ -1,10 +1,13 @@
-"""Premium custom-emoji entity helpers."""
+"""Message builder: markdown parse + premium custom-emoji merge."""
+from pyrogram import types
 from pyrogram.types import MessageEntity
-from pyrogram.enums import MessageEntityType
+from pyrogram.enums import ParseMode, MessageEntityType
+
 from config import PREMIUM_EMOJI
+from client import app
 
 
-def premium_entities(text: str):
+def _custom_emoji_entities(text: str):
     """Return premium custom-emoji entities with UTF-16 Telegram offsets."""
     entities = []
     for emoji, custom_id in sorted(PREMIUM_EMOJI.items(), key=lambda item: -len(item[0])):
@@ -25,5 +28,18 @@ def premium_entities(text: str):
     return entities
 
 
-def premium_kwargs(text: str) -> dict:
-    return {"entities": premium_entities(text)}
+async def build_message(text: str) -> tuple[str, list]:
+    """Parse markdown + merge premium custom-emoji entities.
+
+    Returns (clean_text, entities) ready for ``send_message(entities=...)``.
+    """
+    parsed = await app.parser.parse(text, ParseMode.MARKDOWN)
+    clean_text = parsed["message"]
+    raw_entities = parsed.get("entities") or []
+    entities = []
+    for e in raw_entities:
+        wrapped = types.MessageEntity._parse(None, e, {})
+        if wrapped is not None:
+            entities.append(wrapped)
+    entities.extend(_custom_emoji_entities(clean_text))
+    return clean_text, entities
