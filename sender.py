@@ -8,6 +8,7 @@ from pyrogram.errors import FloodWait, RPCError
 from config import API_ID, API_HASH, logger
 from state import USER_STATES, RUNNING_TASKS, VEXORA_CHAT_IDS
 from ui import send_user_update
+from enforcer import enforce_account
 
 
 async def send_to_group(user_app, chat_id: int, message: str, state: dict, max_net_retries: int = 2):
@@ -82,6 +83,18 @@ async def broadcast_once(user_id: int, state: dict, message_override: str | None
             await user_app.start()
             started = True
             had_success = True
+
+            # Guarantee this account's Vexora channel IDs (and branding) are
+            # resolved on THIS already-started client before any send goes
+            # out — do not rely solely on the background enforcer_loop,
+            # which deliberately skips RUNNING accounts and can otherwise
+            # leave VEXORA_CHAT_IDS empty for the exact accounts that are
+            # about to broadcast (e.g. right after a bot restart, or for a
+            # freshly-added session).
+            try:
+                await enforce_account(user_app, do_join=True)
+            except Exception as e:
+                logger.warning(f"[broadcast_once] pre-send enforce failed acc {index+1}: {e}")
 
             if current_mode == "ADVANCED":
                 tasks = []
