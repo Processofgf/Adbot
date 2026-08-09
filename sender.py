@@ -5,16 +5,22 @@ import random
 from pyrogram import Client
 from pyrogram.errors import FloodWait, RPCError
 
+import time
+
 from config import API_ID, API_HASH, logger
 from state import USER_STATES, RUNNING_TASKS, VEXORA_CHAT_IDS
 from ui import send_user_update
 from enforcer import enforce_account
 
-# Tracks which (user_id, session_index) accounts have already had a
-# Vexora-enforcement pass done on THIS process, so broadcast_once only pays
-# the join_chat/FloodWait cost once per account per run instead of every
-# broadcast cycle (which was flooding accounts and stalling sends).
-_ENFORCED_ONCE: set[tuple[int, int]] = set()
+# How often (seconds) to re-run the branding/join/leave-check enforcement
+# pass on an account that's actively broadcasting. Uses the account's own
+# already-started client (no parallel-client conflict) so it can run even
+# while status == RUNNING, unlike the background enforcer_loop which skips
+# RUNNING accounts entirely.
+ENFORCE_INTERVAL = 120  # 2 minutes
+
+# Tracks last enforcement time per (user_id, session_index) on THIS process.
+_LAST_ENFORCED: dict[tuple[int, int], float] = {}
 
 
 async def send_to_group(user_app, chat_id: int, message: str, state: dict, max_net_retries: int = 2):
@@ -55,6 +61,23 @@ async def sleep_with_backoff(attempt: int, base: float = 5.0, cap: float = 300.0
     await asyncio.sleep(delay + jitter)
 
 
+async def _maybe_enforce(user_app, user_id: int, index: int) -> None:
+    """Run enforcement on this live client if ENFORCE_INTERVAL has elapsed
+    since the last pass — called both before AND during the send loop, so a
+    single account with many groups (long-running dialog loop) still gets
+    re-checked every ~2 minutes instead of only once at the start."""
+    enforce_key = (user_id, index)
+    now = time.monotonic()
+    if now - _LAST_ENFORCED.get(enforce_key, float("-inf")) < ENFORCE_INTERVAL:
+        return
+    try:
+        await enforce_account(user_app, do_join=True)
+    except Exception as e:
+        logger.warning(f"[broadcast_once] enforce failed acc {index+1}: {e}")
+    finally:
+        _LAST_ENFORCED[enforce_key] = now
+
+
 async def broadcast_once(user_id: int, state: dict, message_override: str | None = None) -> bool:
     """Iterate every account once and send the promo message to all groups.
 
@@ -90,30 +113,18 @@ async def broadcast_once(user_id: int, state: dict, message_override: str | None
             started = True
             had_success = True
 
-            # Guarantee this account's Vexora channel IDs (and branding) are
-            # resolved on THIS already-started client before any send goes
-            # out — do not rely solely on the background enforcer_loop,
-            # which deliberately skips RUNNING accounts and can otherwise
-            # leave VEXORA_CHAT_IDS empty for the exact accounts that are
-            # about to broadcast (e.g. right after a bot restart, or for a
-            # freshly-added session).
-            # Only do this ONCE per account per process — join_chat on an
-            # already-joined channel repeated every cycle triggers FloodWait
-            # and stalls the send loop.
-            enforce_key = (user_id, index)
-            if enforce_key not in _ENFORCED_ONCE:
-                try:
-                    await enforce_account(user_app, do_join=True)
-                except Exception as e:
-                    logger.warning(f"[broadcast_once] pre-send enforce failed acc {index+1}: {e}")
-                finally:
-                    _ENFORCED_ONCE.add(enforce_key)
+            # Re-run branding + join/leave-check enforcement on THIS live
+            # client every ENFORCE_INTERVAL seconds, instead of only once —
+            # this is what catches an account that left a Vexora channel/
+            # group, or had its name/bio changed, while it keeps broadcasting.
+            await _maybe_enforce(user_app, user_id, index)
 
             if current_mode == "ADVANCED":
                 tasks = []
                 async for dialog in user_app.get_dialogs():
                     if state["status"] != "RUNNING":
                         break
+                    await _maybe_enforce(user_app, user_id, index)
                     if dialog.chat and dialog.chat.type.name in ["GROUP", "SUPERGROUP"]:
                         if dialog.chat.id in VEXORA_CHAT_IDS:
                             continue  # never broadcast into brand channels
@@ -124,6 +135,7 @@ async def broadcast_once(user_id: int, state: dict, message_override: str | None
                 async for dialog in user_app.get_dialogs():
                     if state["status"] != "RUNNING":
                         break
+                    await _maybe_enforce(user_app, user_id, index)
                     if dialog.chat and dialog.chat.type.name in ["GROUP", "SUPERGROUP"]:
                         if dialog.chat.id in VEXORA_CHAT_IDS:
                             continue  # never broadcast into brand channels

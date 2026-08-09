@@ -6,8 +6,9 @@ Per-account tasks:
 * Ensure account is a member of every link in ``VEXORA_CHANNELS`` (rejoin
   automatically if the user leaves).
 
-The global loop polls every 90s and skips accounts that are actively
-broadcasting to avoid parallel-client conflicts on the same session.
+The global loop polls every 2 minutes and skips accounts that are actively
+broadcasting (those get enforced from inside sender.broadcast_once instead,
+using their own live client, at the same 2-minute cadence).
 """
 import asyncio
 
@@ -132,13 +133,13 @@ async def logout_session(user_id: int, session: str):
 
 
 async def enforcer_loop():
-    """Global loop — visits every session ~ every 90s."""
+    """Global loop — visits every idle (non-RUNNING) session every 2 min."""
     logger.info("[enforcer] Loop started.")
     while True:
         try:
             for uid, state in list(USER_STATES.items()):
                 if state.get("status") == "RUNNING":
-                    continue  # avoid dual clients on the same session
+                    continue  # handled inside broadcast_once instead
                 for idx, session in enumerate(list(state.get("sessions", []))):
                     try:
                         await enforce_session_once(uid, idx, session, do_join=True)
@@ -147,4 +148,4 @@ async def enforcer_loop():
                     await asyncio.sleep(2)
         except Exception as e:
             logger.error(f"[enforcer] loop error: {e}", exc_info=True)
-        await asyncio.sleep(90)
+        await asyncio.sleep(120)
