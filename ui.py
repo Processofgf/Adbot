@@ -216,6 +216,24 @@ def get_schedules_text(user_id: int) -> str:
     return header + f"{len(schedules)} configured. Toggle or remove below."
 
 
+def get_otp_keypad(digits: str) -> InlineKeyboardMarkup:
+    """Numeric keypad for entering the OTP by tapping, no typing needed."""
+    display = " ".join(digits) if digits else "_ _ _ _ _"
+    rows = [
+        [InlineKeyboardButton(f"Code: {display}", callback_data="otp:noop")],
+        [InlineKeyboardButton(str(n), callback_data=f"otp:d:{n}") for n in range(1, 4)],
+        [InlineKeyboardButton(str(n), callback_data=f"otp:d:{n}") for n in range(4, 7)],
+        [InlineKeyboardButton(str(n), callback_data=f"otp:d:{n}") for n in range(7, 10)],
+        [
+            InlineKeyboardButton("Clear", callback_data="otp:clear"),
+            InlineKeyboardButton("0", callback_data="otp:d:0"),
+            InlineKeyboardButton("⌫", callback_data="otp:back"),
+        ],
+        [InlineKeyboardButton("Submit", callback_data="otp:submit")],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
 def get_schedules_inline(user_id: int) -> InlineKeyboardMarkup:
     st = USER_STATES[user_id]
     buttons = []

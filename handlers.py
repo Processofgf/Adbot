@@ -14,7 +14,7 @@ from state import (
 from ui import (
     get_premium_keyboard, cancel_keyboard, remove_account_keyboard,
     get_status_text, WELCOME_TEXT, HELP_TEXT,
-    get_schedules_inline, get_schedules_text,
+    get_schedules_inline, get_schedules_text, get_otp_keypad,
     reply_premium, send_premium, safe_edit_text,
     BTN_RUN, BTN_PAUSE, BTN_STOP, BTN_SET_DELAY, BTN_SET_MESSAGE,
     BTN_MODE_NORMAL, BTN_MODE_ADVANCED, BTN_REFRESH,
@@ -167,7 +167,55 @@ async def schedules_callback(client, callback_query):
             )
 
 
-# ==================== TEXT / KEYBOARD HANDLERS ====================
+# ==================== OTP KEYPAD CALLBACKS ====================
+@app.on_callback_query(filters.regex(r"^otp:"))
+async def otp_keypad_callback(client, callback_query):
+    user_id = callback_query.from_user.id
+    state = initialize_user_state(user_id)
+
+    if state.get("waiting_for") != "otp":
+        await callback_query.answer("No active login.", show_alert=True)
+        return
+
+    parts = callback_query.data.split(":")
+    action = parts[1]
+    digits = state.get("otp_partial", "")
+
+    if action == "noop":
+        await callback_query.answer()
+        return
+
+    if action == "d":
+        if len(digits) < 5:
+            digits += parts[2]
+        await callback_query.answer()
+
+    elif action == "back":
+        digits = digits[:-1]
+        await callback_query.answer()
+
+    elif action == "clear":
+        digits = ""
+        await callback_query.answer()
+
+    elif action == "submit":
+        if len(digits) < 5:
+            await callback_query.answer("Enter all 5 digits.", show_alert=True)
+            return
+        await callback_query.answer()
+        state["otp_partial"] = ""
+        await process_otp_login(client, callback_query.message, user_id, state, digits[:5])
+        return
+
+    state["otp_partial"] = digits
+    await safe_edit_text(
+        callback_query.message,
+        callback_query.message.text or "**Enter OTP**",
+        reply_markup=get_otp_keypad(digits),
+        min_interval=0,
+    )
+
+
 @app.on_message(filters.text & filters.private)
 async def user_text_handler(client, message):
     user_id = message.from_user.id
@@ -338,9 +386,11 @@ async def user_text_handler(client, message):
                 "client":          temp_client,
             }
             state["waiting_for"] = "otp"
+            state["otp_partial"] = ""
             await safe_edit_text(
                 status_msg,
-                f"**Enter OTP for {phone_number}**\nType it here. Spaces or dashes are fine.",
+                f"**Enter OTP for {phone_number}**\nTap the digits below, or type the code.",
+                reply_markup=get_otp_keypad(""),
                 min_interval=0,
             )
         except Exception as e:
