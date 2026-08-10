@@ -1,1 +1,1 @@
-worker: python bot.py & python adminbot.py & wait
+web: python run_all.py

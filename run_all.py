@@ -1,11 +1,16 @@
-"""Single-process launcher — runs BOTH the main Vexora Ads bot and the
-Vexora Admin bot in one event loop.
+"""Single-process launcher — runs the main Vexora Ads bot and (optionally)
+the Vexora Admin bot in ONE event loop.
 
-Use this on Railway when you want ONE service to run everything (recommended):
-    start command:  python run_all.py
+IMPORTANT: the main bot ALWAYS starts. The admin bot is best-effort — if its
+env vars are missing/wrong it is skipped with a clear log line and the main
+bot keeps running. This is the recommended entry point on Railway.
 
-Env vars required (all in the SAME service):
-    BOT_TOKEN, ADMIN_BOT_TOKEN, API_ID, API_HASH, ADMIN_IDS, NEON_DATABASE_URL
+Railway → Settings → Deploy → Custom Start Command:
+    python run_all.py
+
+Env vars (all on the SAME service):
+    Main : BOT_TOKEN, API_ID, API_HASH, NEON_DATABASE_URL
+    Admin: ADMIN_BOT_TOKEN, ADMIN_IDS   (+ shares API_ID/API_HASH/NEON_DATABASE_URL)
 """
 import asyncio
 
@@ -18,13 +23,30 @@ from enforcer import enforcer_loop
 from sender import dedicated_user_worker
 import db
 
-from adminclient import admin_app
-import adminhandlers  # noqa: F401 — registers admin-bot handlers
-import adminstore
+
+async def _start_admin_bot():
+    """Best-effort admin-bot boot. NEVER fatal to the main bot."""
+    try:
+        from adminclient import admin_app
+        import adminhandlers
+        import adminstore
+    except Exception as e:
+        logger.warning(f"[run_all] Admin bot skipped (config not ready): {e}")
+        logger.warning("[run_all] Set ADMIN_BOT_TOKEN + ADMIN_IDS to enable the admin bot. Main bot is running.")
+        return
+    try:
+        await adminstore.init_pool()
+        await adminhandlers.load_dynamic_admins()
+        await admin_app.start()
+        me = await admin_app.get_me()
+        logger.info(f"[run_all] Admin bot online as @{me.username}")
+    except Exception as e:
+        logger.error(f"[run_all] Admin bot failed to start: {e}")
+        logger.error("[run_all] Verify ADMIN_BOT_TOKEN is a valid @BotFather token. Main bot keeps running.")
 
 
 async def start_all():
-    # ---- main bot ----
+    # ---- main bot (mandatory) ----
     logger.info("[run_all] Booting main bot...")
     await db.init_db()
     loaded = await db.load_all()
@@ -45,22 +67,13 @@ async def start_all():
     asyncio.create_task(scheduler_loop())
     asyncio.create_task(enforcer_loop())
 
-    # ---- admin bot ----
-    logger.info("[run_all] Booting admin bot...")
-    try:
-        await adminstore.init_pool()
-        await adminhandlers.load_dynamic_admins()
-        await admin_app.start()
-        me_admin = await admin_app.get_me()
-        logger.info(f"[run_all] Admin bot online as @{me_admin.username}")
-    except Exception as e:
-        logger.error(f"[run_all] ADMIN BOT FAILED TO START: {e}", exc_info=True)
-        logger.error("[run_all] Main bot keeps running. Check ADMIN_BOT_TOKEN / API creds.")
+    # ---- admin bot (optional) ----
+    await _start_admin_bot()
 
 
 async def _bootstrap():
     await start_all()
-    logger.info("[run_all] Both bots online.")
+    logger.info("[run_all] Ready.")
     await asyncio.Event().wait()
 
 
