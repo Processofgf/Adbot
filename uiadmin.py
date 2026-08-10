@@ -177,6 +177,11 @@ HELP_TEXT = (
     "Send a session string; the bot logs out every OTHER device on that "
     "account while keeping its own session (and the exported `.session`) valid.\n"
     "\n"
+    "**👑 Owner commands**\n"
+    "`/addadmin <id | @username>` — grant admin access\n"
+    "`/deladmin <id | @username>` — revoke access\n"
+    "`/admins` — list all admins\n"
+    "\n"
     "Made by **Vexora** 💫"
 )
 

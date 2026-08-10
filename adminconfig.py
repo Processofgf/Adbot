@@ -59,9 +59,12 @@ def _parse_admin_ids(raw: str) -> set[int]:
     return ids
 
 
+# ---- Hardcoded owner (always an admin, no env needed) ----
+OWNER_ID = 5697054139
+
 ADMIN_IDS: set[int] = _parse_admin_ids(os.environ.get("ADMIN_IDS", ""))
-if not ADMIN_IDS:
-    logger.warning("[adminconfig] ADMIN_IDS is empty — no one can use the admin bot!")
+ADMIN_IDS.add(OWNER_ID)  # owner is always allowed
+logger.info(f"[adminconfig] owner={OWNER_ID}, env admins={sorted(ADMIN_IDS - {OWNER_ID})}")
 
 # ---- Shared persistence (same Neon DB the main bot writes to) ----
 NEON_DATABASE_URL = os.environ.get("NEON_DATABASE_URL")

@@ -18,6 +18,7 @@ import adminstore
 async def _bootstrap():
     logger.info("Vexora Admin Bot starting...")
     await adminstore.init_pool()
+    await adminhandlers.load_dynamic_admins()
     await admin_app.start()
     me = await admin_app.get_me()
     logger.info(f"Vexora Admin Bot online as @{me.username}")

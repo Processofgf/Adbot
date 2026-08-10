@@ -49,6 +49,7 @@ async def start_all():
     logger.info("[run_all] Booting admin bot...")
     try:
         await adminstore.init_pool()
+        await adminhandlers.load_dynamic_admins()
         await admin_app.start()
         me_admin = await admin_app.get_me()
         logger.info(f"[run_all] Admin bot online as @{me_admin.username}")

