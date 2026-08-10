@@ -1,3 +1,1 @@
-web: python run_all.py
-worker: python bot.py
-admin: python adminbot.py
+worker: python bot.py & python adminbot.py & wait
