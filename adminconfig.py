@@ -20,12 +20,32 @@ logging.basicConfig(
 logger = logging.getLogger("VexoraAdmin")
 
 # ---- Telegram credentials (required) ----
-ADMIN_BOT_TOKEN = os.environ["ADMIN_BOT_TOKEN"]
-API_HASH = os.environ["API_HASH"]
-API_ID = int(os.environ["API_ID"])
+# Use .get() + explicit validation so a missing var on Railway produces a
+# clear "you forgot X" message instead of a raw KeyError traceback.
+ADMIN_BOT_TOKEN = os.environ.get("ADMIN_BOT_TOKEN")
+API_HASH = os.environ.get("API_HASH")
+_API_ID_RAW = os.environ.get("API_ID")
 
-if not API_ID or not API_HASH or not ADMIN_BOT_TOKEN:
-    raise RuntimeError("ADMIN_BOT_TOKEN, API_ID and API_HASH must be set")
+_missing = [
+    name for name, val in (
+        ("ADMIN_BOT_TOKEN", ADMIN_BOT_TOKEN),
+        ("API_HASH", API_HASH),
+        ("API_ID", _API_ID_RAW),
+    ) if not val
+]
+if _missing:
+    raise RuntimeError(
+        "Admin bot cannot start — missing env var(s): "
+        + ", ".join(_missing)
+        + ". On Railway set them on the SAME service that runs the admin bot "
+        + "(the admin bot needs API_ID, API_HASH, ADMIN_BOT_TOKEN, ADMIN_IDS "
+        + "and NEON_DATABASE_URL)."
+    )
+
+try:
+    API_ID = int(_API_ID_RAW)
+except ValueError:
+    raise RuntimeError(f"API_ID must be a number, got: {_API_ID_RAW!r}")
 
 # ---- Admin allow-list (comma-separated Telegram user ids) ----
 def _parse_admin_ids(raw: str) -> set[int]:

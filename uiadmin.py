@@ -190,9 +190,9 @@ def get_stats_text(accounts: list[dict], scanned: bool) -> str:
     total = len(accounts)
     ok = sum(1 for a in accounts if a["ok"])
     dead = total - ok
-    nft = sum(1 for a in accounts if a["category"] == "nft")
-    prem = sum(1 for a in accounts if a["category"] == "premium")
-    reg = sum(1 for a in accounts if a["category"] == "regular")
+    nft = sum(1 for a in accounts if a["ok"] and a["category"] == "nft")
+    prem = sum(1 for a in accounts if a["ok"] and a["category"] == "premium")
+    reg = sum(1 for a in accounts if a["ok"] and a["category"] == "regular")
     return (
         "📊 **Scan Results**\n"
         "\n"

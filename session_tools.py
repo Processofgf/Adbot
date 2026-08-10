@@ -68,6 +68,8 @@ def build_session_file(session_string: str, out_basepath: str) -> str:
     """Write a Telethon ``.session`` SQLite file. Returns the file path."""
     info = parse_pyrogram_session(session_string)
     dc_id = info["dc_id"]
+    if dc_id not in _DC_IP:
+        logger.warning(f"[build_session_file] unknown dc_id={dc_id}; defaulting to DC2 IP")
     ip = _DC_IP.get(dc_id, _DC_IP[2])
 
     sess = SQLiteSession(out_basepath)   # Telethon appends ".session"
