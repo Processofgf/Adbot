@@ -1,13 +1,18 @@
 """Broadcast workers and per-account sending logic.
 
-Every account runs as its own concurrent async worker. Sends inside an account
-are bounded by an adaptive semaphore that shrinks on FloodWait (this account
-only) and grows back after a clean streak — self-tuning to the fastest rate
-Telegram tolerates, with no fixed sleep between cycles.
+Speed model (the safe, sustainable one):
+  * Each account runs as its own async worker; ALL accounts run concurrently —
+    this is where real throughput comes from.
+  * WITHIN an account we send ONE message at a time, spaced by an adaptive
+    delay (Pacer). Concurrency > 1 per account is exactly what makes Telegram
+    slap the account with a multi-minute global FloodWait, so we never do it.
+  * On FloodWait we wait the FULL time Telegram asks for (this account only)
+    and slow the pacer down; after a clean streak the pacer speeds back up.
+    No fixed 15s sleep — the pacer self-tunes to the fastest safe rate.
 
-All send failures go through error_classifier.classify() → a single Decision:
+All send failures go through error_classifier.classify() -> one Decision:
   RETRY        transient, limited retries
-  BACKOFF      FloodWait/slowmode — pause THIS account, retry same chat
+  BACKOFF      FloodWait/slowmode — wait wait_seconds, retry same chat
   SKIP_GROUP   remember (account, chat) ban forever, drop the chat
   DISABLE_ACCT frozen/banned/auth-dead — tear the account down, notify once
 """
@@ -16,121 +21,61 @@ import time
 
 from pyrogram import Client
 
-from config import API_ID, API_HASH, ADMIN_ID, logger
+from config import API_ID, API_HASH, logger
 from state import USER_STATES, RUNNING_TASKS, VEXORA_CHAT_IDS
 from ui import send_user_update
 from enforcer import enforce_account
 from error_classifier import classify, Action
 import bans
 
-# How often (seconds) to re-run the branding/join/leave-check enforcement
-# pass on an account that's actively broadcasting.
-ENFORCE_INTERVAL = 120  # 2 minutes
+# How often (seconds) to re-run branding/join enforcement on a live client.
+ENFORCE_INTERVAL = 300  # 5 minutes (kept infrequent to avoid join FloodWaits)
 
 # Tracks last enforcement time per (user_id, account_id) on THIS process.
 _LAST_ENFORCED: dict[tuple[int, int], float] = {}
 
-# Adaptive controller tuning.
-_SEM_START = 5      # start at 5 concurrent sends per account
-_SEM_FLOOR = 1
-_SEM_CEIL = 15
-_GROW_AFTER = 20    # clean sends before growing the limit by 1
+# Per-account pacer cache so a flood-learned slowdown survives across cycles.
+_PACERS: dict[tuple[int, int], "Pacer"] = {}
+
+# Adaptive pacing (seconds between sends, per account).
+_PACE_BASE = 3.0     # start ~1 msg / 3s per account
+_PACE_FLOOR = 2.0    # never go faster than this
+_PACE_CEIL = 60.0    # never crawl slower than this
+_SPEEDUP_AFTER = 5   # clean sends before we speed up a notch
 _MAX_TRANSIENT_RETRIES = 2
+_MAX_FLOOD_RETRIES = 3   # give up on a chat after this many FloodWaits in a row
 
 
-class AdaptiveLimiter:
-    """Per-account concurrency limiter that reacts to FloodWait.
+class Pacer:
+    """Per-account adaptive inter-send delay. Slows on flood, speeds when clean."""
 
-    * acquire() blocks while at the limit AND while a flood pause is active.
-    * on_success() grows the limit after a clean streak (up to ceiling).
-    * on_flood(secs) halves the limit and pauses this account for `secs`.
-    """
-
-    def __init__(self, start=_SEM_START, floor=_SEM_FLOOR, ceiling=_SEM_CEIL,
-                 grow_after=_GROW_AFTER):
-        self.limit = start
+    def __init__(self, base=_PACE_BASE, floor=_PACE_FLOOR, ceil=_PACE_CEIL):
+        self.delay = base
         self.floor = floor
-        self.ceiling = ceiling
-        self.grow_after = grow_after
-        self._in_flight = 0
-        self._pause_until = 0.0
+        self.ceil = ceil
         self._ok = 0
-        self._cond = asyncio.Condition()
 
-    async def acquire(self):
-        # Respect a flood pause first (released lock while sleeping).
-        while True:
-            now = time.monotonic()
-            if now < self._pause_until:
-                await asyncio.sleep(self._pause_until - now)
-                continue
-            break
-        async with self._cond:
-            while self._in_flight >= self.limit:
-                await self._cond.wait()
-            self._in_flight += 1
-
-    async def release(self):
-        async with self._cond:
-            self._in_flight -= 1
-            self._cond.notify(1)
-
-    async def on_success(self):
-        async with self._cond:
-            self._ok += 1
-            if self._ok >= self.grow_after and self.limit < self.ceiling:
-                self.limit += 1
-                self._ok = 0
-                self._cond.notify(1)
-
-    async def on_flood(self, wait_seconds: int):
-        async with self._cond:
-            self._pause_until = time.monotonic() + max(1, wait_seconds)
+    def on_ok(self):
+        self._ok += 1
+        if self._ok >= _SPEEDUP_AFTER:
+            self.delay = max(self.floor, self.delay * 0.8)
             self._ok = 0
-            if self.limit > self.floor:
-                self.limit = max(self.floor, self.limit // 2)
 
-
-async def _send_one(client, chat_id, message, state, limiter, account_id, disable_evt, disable_reason):
-    """Send to one chat, handling its own retries/flood/ban in place.
-
-    Returns True if a message was actually sent (for cycle idle-detection).
-    """
-    attempts = 0
-    while state["status"] == "RUNNING" and not disable_evt.is_set():
-        await limiter.acquire()
-        try:
-            await client.send_message(chat_id, message)
-            state["sent_count"] += 1
-            await limiter.on_success()
-            return True
-        except Exception as e:
-            dec = classify(e)
-            if dec.action == Action.BACKOFF:
-                logger.info(f"[send] FloodWait {dec.wait_seconds}s acc={account_id} chat={chat_id}")
-                await limiter.on_flood(dec.wait_seconds)
-                continue  # retry same chat after the pause
-            if dec.action == Action.SKIP_GROUP:
-                await bans.record_group_ban(account_id, chat_id, dec.reason)
-                return False
-            if dec.action == Action.DISABLE_ACCT:
-                disable_reason["reason"] = dec.reason
-                disable_evt.set()
-                return False
-            # RETRY — transient
-            attempts += 1
-            if attempts > _MAX_TRANSIENT_RETRIES:
-                state["failed_count"] += 1
-                logger.warning(f"[send] giving up chat={chat_id} acc={account_id}: {e}")
-                return False
-            await asyncio.sleep(2 ** attempts)
-        finally:
-            await limiter.release()
-    return False
+    def on_flood(self):
+        self._ok = 0
+        self.delay = min(self.ceil, self.delay * 1.5)
 
 
 async def _account_broadcast(user_id: int, index: int, session: str, state: dict, message: str) -> str:
-    """Run one broadcast pass for a single account. Returns 'ok'|'disabled'|'idle'."""
+    """One broadcast pass for a single account. Returns 'ok'|'disabled'|'idle'."""
+    # Skip a known-dead session up front — no reconnect, pull it from rotation.
+    if bans.is_session_disabled(session):
+        try:
+            state["sessions"].remove(session)
+        except ValueError:
+            pass
+        return "disabled"
+
     client = Client(
         f"User_{user_id}_Acc_{index}",
         session_string=session,
@@ -140,8 +85,7 @@ async def _account_broadcast(user_id: int, index: int, session: str, state: dict
     )
     started = False
     account_id = None
-    disable_evt = asyncio.Event()
-    disable_reason: dict = {}
+    disable_reason: str | None = None
     sent_any = False
     try:
         await client.start()
@@ -150,69 +94,103 @@ async def _account_broadcast(user_id: int, index: int, session: str, state: dict
         me = await client.get_me()
         account_id = me.id
 
-        # Self-heal: session for an already-disabled account — pull it now.
+        # Self-heal: another session of an already-disabled account — pull it.
         if bans.is_account_disabled(account_id):
-            disable_reason["reason"] = "already_disabled"
-            disable_evt.set()
-            return "disabled"
+            disable_reason = "already_disabled"
 
-        # Periodic branding enforcement on this live client.
-        enforce_key = (user_id, account_id)
-        now = time.monotonic()
-        if now - _LAST_ENFORCED.get(enforce_key, 0) >= ENFORCE_INTERVAL:
-            try:
-                await enforce_account(client, do_join=True)
-            except Exception as e:
-                logger.warning(f"[account] enforce failed acc={account_id}: {e}")
-            finally:
-                _LAST_ENFORCED[enforce_key] = now
+        # Periodic branding enforcement on this live client (infrequent).
+        if not disable_reason:
+            enforce_key = (user_id, account_id)
+            now = time.monotonic()
+            if now - _LAST_ENFORCED.get(enforce_key, 0) >= ENFORCE_INTERVAL:
+                try:
+                    await enforce_account(client, do_join=True)
+                except Exception as e:
+                    logger.warning(f"[account] enforce failed acc={account_id}: {e}")
+                finally:
+                    _LAST_ENFORCED[enforce_key] = now
 
         # Build the target list, skipping brand channels + remembered bans.
         targets: list[int] = []
-        async for dialog in client.get_dialogs():
-            if state["status"] != "RUNNING":
-                break
-            chat = dialog.chat
-            if not chat or chat.type.name not in ("GROUP", "SUPERGROUP"):
-                continue
-            if chat.id in VEXORA_CHAT_IDS:
-                continue
-            if bans.is_group_banned(account_id, chat.id):
-                continue
-            targets.append(chat.id)
+        if not disable_reason:
+            async for dialog in client.get_dialogs():
+                if state["status"] != "RUNNING":
+                    break
+                chat = dialog.chat
+                if not chat or chat.type.name not in ("GROUP", "SUPERGROUP"):
+                    continue
+                if chat.id in VEXORA_CHAT_IDS:
+                    continue
+                if bans.is_group_banned(account_id, chat.id):
+                    continue
+                targets.append(chat.id)
 
-        if not targets:
+        if not disable_reason and not targets:
             return "idle"
 
-        # Adaptive concurrent dispatch: a bounded pool of workers pulls chats
-        # from a queue; each worker gates real concurrency through the limiter.
-        limiter = AdaptiveLimiter()
-        queue: asyncio.Queue = asyncio.Queue()
-        for cid in targets:
-            queue.put_nowait(cid)
+        pacer = _PACERS.setdefault((user_id, account_id), Pacer())
+        # Sequential, adaptively paced sends — one at a time for THIS account.
+        for i, chat_id in enumerate(targets):
+            if state["status"] != "RUNNING" or disable_reason:
+                break
 
-        async def worker():
-            nonlocal sent_any
-            while state["status"] == "RUNNING" and not disable_evt.is_set():
+            floods = 0
+            attempts = 0
+            while True:
+                if state["status"] != "RUNNING":
+                    break
                 try:
-                    cid = queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    return
-                ok = await _send_one(client, cid, message, state, limiter,
-                                     account_id, disable_evt, disable_reason)
-                if ok:
+                    await client.send_message(chat_id, message)
+                    state["sent_count"] += 1
                     sent_any = True
+                    pacer.on_ok()
+                    if i < len(targets) - 1:               # no wasted delay after the last chat
+                        await asyncio.sleep(pacer.delay)
+                    break
+                except Exception as e:
+                    dec = classify(e)
+                    if dec.action == Action.BACKOFF:
+                        floods += 1
+                        pacer.on_flood()
+                        logger.info(
+                            f"[send] FloodWait {dec.wait_seconds}s acc={account_id} "
+                            f"chat={chat_id} (pace now {pacer.delay:.1f}s)"
+                        )
+                        if floods > _MAX_FLOOD_RETRIES:
+                            # This chat keeps flooding — leave it for next cycle.
+                            state["failed_count"] += 1
+                            break
+                        # Honor Telegram's wait FULLY for this account, then retry.
+                        await asyncio.sleep(dec.wait_seconds + 1)
+                        continue
+                    if dec.action == Action.SKIP_GROUP:
+                        await bans.record_group_ban(account_id, chat_id, dec.reason)
+                        break
+                    if dec.action == Action.DISABLE_ACCT:
+                        disable_reason = dec.reason
+                        break
+                    # RETRY — transient
+                    attempts += 1
+                    if attempts > _MAX_TRANSIENT_RETRIES:
+                        state["failed_count"] += 1
+                        logger.warning(f"[send] giving up chat={chat_id} acc={account_id}: {e}")
+                        break
+                    await asyncio.sleep(2 ** attempts)
 
-        pool = [asyncio.create_task(worker()) for _ in range(_SEM_CEIL)]
-        await asyncio.gather(*pool)
+            if disable_reason:
+                break
 
     except asyncio.CancelledError:
         raise
     except Exception as e:
         dec = classify(e)
         if dec.action == Action.DISABLE_ACCT:
-            disable_reason["reason"] = dec.reason
-            disable_evt.set()
+            disable_reason = dec.reason
+        elif dec.action == Action.BACKOFF:
+            # FloodWait during start()/get_dialogs — wait it out so we don't
+            # reconnect-spam this account while Telegram is cooling it down.
+            logger.info(f"[account] setup FloodWait {dec.wait_seconds}s acc={account_id or index+1}")
+            await asyncio.sleep(dec.wait_seconds + 1)
         else:
             logger.error(f"[account] acc {index+1} (id={account_id}) error: {e}")
             await send_user_update(user_id, f"⚠️ **Account {index+1}:** connection error. Retrying next cycle.")
@@ -223,18 +201,16 @@ async def _account_broadcast(user_id: int, index: int, session: str, state: dict
             except Exception as e:
                 logger.debug(f"[account] stop() error acc={account_id}: {e}")
 
-    if disable_evt.is_set():
-        reason = disable_reason.get("reason", "account_frozen_or_banned")
-        await bans.disable_account(account_id, reason)
-        # Pull the session out of rotation for good (safe remove-by-value).
+    if disable_reason:
+        await bans.disable_account(session, account_id, disable_reason)
         try:
             state["sessions"].remove(session)
         except ValueError:
             pass
-        await bans.notify_admin_once(account_id, reason, user_id)
+        await bans.notify_admin_once(session, account_id, disable_reason, user_id)
         await send_user_update(
             user_id,
-            f"🛑 **Account {index+1} auto-removed:** {reason}. It won't be used again.",
+            f"🛑 **Account {index+1} auto-removed:** {disable_reason}. It won't be used again.",
         )
         return "disabled"
 
@@ -244,7 +220,7 @@ async def _account_broadcast(user_id: int, index: int, session: str, state: dict
 async def broadcast_once(user_id: int, state: dict, message_override: str | None = None) -> bool:
     """Run every account's broadcast pass concurrently (one pass each).
 
-    Returns True if at least one account ran and sent at least one message.
+    Returns True if at least one account sent at least one message this pass.
     """
     message = message_override or state["message"]
     if state["status"] not in ("RUNNING", "PAUSED"):
@@ -273,11 +249,12 @@ async def broadcast_once(user_id: int, state: dict, message_override: str | None
 async def dedicated_user_worker(user_id: int):
     """Main loop for manual RUN. Keeps broadcasting until STOPPED.
 
-    No fixed inter-cycle sleep. It only idles briefly when a whole cycle had
-    nothing to send (e.g. every group already banned) to avoid busy-spinning
-    on get_dialogs; active cycles chain back-to-back at Telegram's max safe rate.
+    No fixed inter-cycle sleep. It idles (growing backoff) only when a whole
+    cycle sent nothing — e.g. every account is in a FloodWait cooldown or every
+    group is banned — so it doesn't reconnect-spam. Productive cycles chain
+    back-to-back at the pacer's self-tuned safe rate.
     """
-    idle_backoff = 2
+    idle_backoff = 5
     try:
         while True:
             state = USER_STATES.get(user_id)
@@ -298,12 +275,10 @@ async def dedicated_user_worker(user_id: int):
                 break
 
             if sent_something:
-                idle_backoff = 2  # reset; go straight into the next cycle
+                idle_backoff = 5
             else:
-                # Nothing sent this cycle — back off a little (cap 60s) so we
-                # don't hammer get_dialogs when every group is banned/idle.
                 await asyncio.sleep(idle_backoff)
-                idle_backoff = min(idle_backoff * 2, 60)
+                idle_backoff = min(idle_backoff * 2, 120)
     except asyncio.CancelledError:
         logger.info(f"[Worker] Task cancelled for user {user_id}")
     except Exception as e:

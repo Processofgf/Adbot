@@ -37,32 +37,38 @@ async def init_db():
             )
         """)
         # Frozen / banned / auth-dead accounts pulled from rotation for good.
+        # Keyed by session fingerprint (always known, even if the account dies
+        # before we can read its Telegram id); account_id stored when known.
         await conn.execute("""
-            CREATE TABLE IF NOT EXISTS disabled_accounts (
-                account_id   BIGINT PRIMARY KEY,
-                reason       TEXT,
-                disabled_at  TIMESTAMPTZ DEFAULT now(),
-                notified     BOOLEAN NOT NULL DEFAULT FALSE
+            CREATE TABLE IF NOT EXISTS disabled_sessions (
+                session_hash  TEXT PRIMARY KEY,
+                account_id    BIGINT,
+                reason        TEXT,
+                disabled_at   TIMESTAMPTZ DEFAULT now(),
+                notified      BOOLEAN NOT NULL DEFAULT FALSE
             )
         """)
     logger.info("[db] Connected to Neon Postgres.")
 
 
-async def load_ban_memory() -> tuple[set[tuple[int, int]], set[int], set[int]]:
-    """Return (banned_pairs, disabled_account_ids, notified_account_ids)."""
+async def load_ban_memory():
+    """Return (banned_pairs, disabled_fps, disabled_account_ids, notified_fps)."""
     if not _pool:
-        return set(), set(), set()
+        return set(), set(), set(), set()
     try:
         async with _pool.acquire() as conn:
             ban_rows = await conn.fetch("SELECT account_id, chat_id FROM group_bans")
-            dis_rows = await conn.fetch("SELECT account_id, notified FROM disabled_accounts")
+            dis_rows = await conn.fetch(
+                "SELECT session_hash, account_id, notified FROM disabled_sessions"
+            )
     except Exception as e:
         logger.warning(f"[db] load_ban_memory failed: {e}")
-        return set(), set(), set()
+        return set(), set(), set(), set()
     pairs = {(r["account_id"], r["chat_id"]) for r in ban_rows}
-    disabled = {r["account_id"] for r in dis_rows}
-    notified = {r["account_id"] for r in dis_rows if r["notified"]}
-    return pairs, disabled, notified
+    disabled_fps = {r["session_hash"] for r in dis_rows}
+    disabled_ids = {r["account_id"] for r in dis_rows if r["account_id"] is not None}
+    notified_fps = {r["session_hash"] for r in dis_rows if r["notified"]}
+    return pairs, disabled_fps, disabled_ids, notified_fps
 
 
 async def add_group_ban(account_id: int, chat_id: int, reason: str):
@@ -82,34 +88,35 @@ async def add_group_ban(account_id: int, chat_id: int, reason: str):
         logger.warning(f"[db] add_group_ban({account_id},{chat_id}) failed: {e}")
 
 
-async def add_disabled_account(account_id: int, reason: str):
+async def add_disabled_session(session_hash: str, account_id: int | None, reason: str):
     if not _pool:
         return
     try:
         async with _pool.acquire() as conn:
             await conn.execute(
                 """
-                INSERT INTO disabled_accounts (account_id, reason)
-                VALUES ($1, $2)
-                ON CONFLICT (account_id) DO NOTHING
+                INSERT INTO disabled_sessions (session_hash, account_id, reason)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (session_hash)
+                DO UPDATE SET account_id = COALESCE(disabled_sessions.account_id, EXCLUDED.account_id)
                 """,
-                account_id, reason,
+                session_hash, account_id, reason,
             )
     except Exception as e:
-        logger.warning(f"[db] add_disabled_account({account_id}) failed: {e}")
+        logger.warning(f"[db] add_disabled_session({session_hash[:8]}) failed: {e}")
 
 
-async def mark_notified(account_id: int):
+async def mark_notified(session_hash: str):
     if not _pool:
         return
     try:
         async with _pool.acquire() as conn:
             await conn.execute(
-                "UPDATE disabled_accounts SET notified = TRUE WHERE account_id = $1",
-                account_id,
+                "UPDATE disabled_sessions SET notified = TRUE WHERE session_hash = $1",
+                session_hash,
             )
     except Exception as e:
-        logger.warning(f"[db] mark_notified({account_id}) failed: {e}")
+        logger.warning(f"[db] mark_notified({session_hash[:8]}) failed: {e}")
 
 
 def _sanitize(state: dict) -> dict:
