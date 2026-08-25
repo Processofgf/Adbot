@@ -9,17 +9,18 @@ import asyncio
 from config import logger
 from client import app
 import handlers  # noqa: F401  — registers @app.on_message / @app.on_callback_query
-from state import USER_STATES, RUNNING_TASKS, ensure_accounts
+from state import USER_STATES, RUNNING_TASKS
 from scheduler import scheduler_loop
 from enforcer import enforcer_loop
 from sender import dedicated_user_worker
-from twofa import twofa_loop
 import db
+import bans
 
 
 async def _bootstrap():
     logger.info("Vexora Ads Bot starting...")
     await db.init_db()
+    await bans.load_memory()
     loaded = await db.load_all()
     if loaded:
         USER_STATES.update(loaded)
@@ -32,7 +33,6 @@ async def _bootstrap():
     # never get populated for it. Either resume the worker or drop the
     # stale status back to STOPPED so enforcement can proceed normally.
     for uid, state in list(USER_STATES.items()):
-        ensure_accounts(state)
         if state.get("status") in ("RUNNING", "PAUSED") and state.get("sessions"):
             state["status"] = "RUNNING"
             RUNNING_TASKS[uid] = asyncio.create_task(dedicated_user_worker(uid))
@@ -42,7 +42,6 @@ async def _bootstrap():
 
     asyncio.create_task(scheduler_loop())
     asyncio.create_task(enforcer_loop())
-    asyncio.create_task(twofa_loop())
     logger.info("Vexora Ads Bot online.")
     await asyncio.Event().wait()
 

@@ -23,11 +23,8 @@ if not API_ID or not API_HASH or not BOT_TOKEN:
 # ---- Persistence (optional). Set on Railway to enable. ----
 NEON_DATABASE_URL = os.environ.get("NEON_DATABASE_URL")
 
-# ---- 2FA change-detection schedule (seconds between full sweeps) ----
-try:
-    TWOFA_CHECK_INTERVAL = int(os.environ.get("TWOFA_CHECK_INTERVAL", "300"))
-except ValueError:
-    TWOFA_CHECK_INTERVAL = 300
+# ---- Admin (optional). Telegram user id that receives auto-removal notices. ----
+ADMIN_ID = int(os.environ.get("ADMIN_ID", 0) or 0)
 
 # ---- Brand ----
 VEXORA_BOT_USERNAME = "@VexoraAdsBot"

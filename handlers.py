@@ -10,13 +10,11 @@ from state import (
     USER_STATES, RUNNING_TASKS,
     initialize_user_state, cleanup_user_login,
     persist, persist_bg,
-    ensure_accounts, record_last_account, remove_account_at, has_2fa_alert,
 )
 from ui import (
     get_premium_keyboard, cancel_keyboard, remove_account_keyboard,
     get_status_text, WELCOME_TEXT, HELP_TEXT,
     get_schedules_inline, get_schedules_text, get_otp_keypad,
-    get_locked_keyboard, panel_keyboard,
     reply_premium, send_premium, safe_edit_text,
     BTN_RUN, BTN_PAUSE, BTN_STOP, BTN_SET_DELAY, BTN_SET_MESSAGE,
     BTN_MODE_NORMAL, BTN_MODE_ADVANCED, BTN_REFRESH,
@@ -28,7 +26,6 @@ from scheduler import (
     parse_hhmm, parse_interval_minutes,
 )
 from enforcer import enforce_account, logout_session
-from twofa import resolve_account_2fa, account_label
 
 
 # ==================== /start & /panel ====================
@@ -40,9 +37,9 @@ async def show_panel(client, message):
     await cleanup_user_login(user_id, state)
 
     if message.command and message.command[0].lower() == "start":
-        await reply_premium(message, WELCOME_TEXT, reply_markup=panel_keyboard(state))
+        await reply_premium(message, WELCOME_TEXT, reply_markup=get_premium_keyboard(state["sending_mode"]))
     else:
-        await reply_premium(message, get_status_text(user_id), reply_markup=panel_keyboard(state))
+        await reply_premium(message, get_status_text(user_id), reply_markup=get_premium_keyboard(state["sending_mode"]))
 
 
 async def _brand_and_join_on_add(user_id: int, session_string: str):
@@ -74,17 +71,16 @@ async def process_otp_login(client, message, user_id: int, state: dict, otp_code
         await temp_client.sign_in(login_data["phone"], login_data["phone_code_hash"], otp_code)
         string_session = await temp_client.export_session_string()
         state["sessions"].append(string_session)
-        record_last_account(state, twofa="", phone=login_data.get("phone"), has_2fa=False)
 
         await temp_client.disconnect()
         state["waiting_for"] = None
         state["login_data"] = {}
-        await reply_premium(message, "**Account added.**", reply_markup=panel_keyboard(state))
+        await reply_premium(message, "**Account added.**", reply_markup=get_premium_keyboard(state["sending_mode"]))
 
         await _brand_and_join_on_add(user_id, string_session)
         await persist(user_id)
 
-        await send_premium(user_id, get_status_text(user_id), reply_markup=panel_keyboard(state))
+        await send_premium(user_id, get_status_text(user_id), reply_markup=get_premium_keyboard(state["sending_mode"]))
 
     except SessionPasswordNeeded:
         state["waiting_for"] = "password"
@@ -98,7 +94,7 @@ async def process_otp_login(client, message, user_id: int, state: dict, otp_code
             pass
         state["waiting_for"] = None
         state["login_data"] = {}
-        await reply_premium(message, "**Wrong OTP.**", reply_markup=panel_keyboard(state))
+        await reply_premium(message, "**Wrong OTP.**", reply_markup=get_premium_keyboard(state["sending_mode"]))
 
 
 # ==================== SCHEDULES INLINE CALLBACKS ====================
@@ -225,42 +221,7 @@ async def user_text_handler(client, message):
     user_id = message.from_user.id
     text = message.text.strip()
     state = initialize_user_state(user_id)
-    locked = has_2fa_alert(state)
-    kb = panel_keyboard(state)
-
-    # ---- 2FA lock: only Add (set new 2FA) / Remove / Cancel / Refresh work ----
-    if locked and state.get("waiting_for") not in ("resolve_2fa",):
-        allowed = text in (BTN_ADD_ACC, BTN_REMOVE_ACC, BTN_CANCEL, BTN_REFRESH) \
-            or text.startswith("Remove Profile ")
-        if not allowed:
-            flagged = next((a for a in state["accounts"] if a.get("alert")), None)
-            label = account_label(flagged) if flagged else "your account"
-            verb = "is removed" if (flagged and flagged.get("alert") == "removed") else "was changed"
-            await reply_premium(
-                message,
-                f"⚠️ Your 2FA {verb}, please enter new 2FA for {label}\n\n"
-                "Tap **Add Account** to set a new 2FA, or **Remove Account**.",
-                reply_markup=get_locked_keyboard(),
-            )
-            return
-
-    # ---- 2FA resolve: "Add Account" while locked sets/records the new 2FA ----
-    if locked and text == BTN_ADD_ACC:
-        idx = next((i for i, a in enumerate(state["accounts"]) if a.get("alert")), None)
-        if idx is None:
-            await reply_premium(message, "Nothing to resolve.", reply_markup=panel_keyboard(state))
-            return
-        state["resolve_idx"] = idx
-        state["waiting_for"] = "resolve_2fa"
-        label = account_label(state["accounts"][idx])
-        await reply_premium(
-            message,
-            f"🔑 **Set new 2FA for {label}**\n"
-            "Send the new cloud password.\n"
-            "Send `none` if the account currently has no 2FA.",
-            reply_markup=cancel_keyboard(),
-        )
-        return
+    kb = get_premium_keyboard(state["sending_mode"])
 
     if text == BTN_REFRESH:
         state["waiting_for"] = None
@@ -343,48 +304,25 @@ async def user_text_handler(client, message):
         try:
             idx = int(text.split(" ")[2]) - 1
             if 0 <= idx < len(state["sessions"]):
-                session_string = remove_account_at(state, idx)
+                session_string = state["sessions"].pop(idx)
                 await persist(user_id)
                 # Best-effort remote logout in background so the panel stays snappy.
                 asyncio.create_task(logout_session(user_id, session_string))
                 await reply_premium(
                     message,
                     "Account removed. Logging it out server-side...\n\n" + get_status_text(user_id),
-                    reply_markup=panel_keyboard(state),
+                    reply_markup=kb,
                 )
             else:
-                await reply_premium(message, "Invalid selection.", reply_markup=panel_keyboard(state))
+                await reply_premium(message, "Invalid selection.", reply_markup=kb)
         except Exception as e:
             logger.warning(f"[remove_account] Parse error for user {user_id}: {e}")
-            await reply_premium(message, "Action failed.", reply_markup=panel_keyboard(state))
+            await reply_premium(message, "Action failed.", reply_markup=kb)
         return
 
     # ---- sequential inputs ----
     current_action = state["waiting_for"]
     if not current_action:
-        return
-
-    if current_action == "resolve_2fa":
-        ensure_accounts(state)
-        idx = state.get("resolve_idx")
-        if idx is None or idx >= len(state["sessions"]):
-            state["waiting_for"] = None
-            state["resolve_idx"] = None
-            await reply_premium(message, "Nothing to resolve.", reply_markup=panel_keyboard(state))
-            return
-        session = state["sessions"][idx]
-        acc = state["accounts"][idx]
-        status_msg = await message.reply_text("🔑 Applying 2FA change...")
-        ok, info = await resolve_account_2fa(user_id, idx, session, acc, message.text)
-        if ok:
-            acc["alert"] = None
-            state["waiting_for"] = None
-            state["resolve_idx"] = None
-            await persist(user_id)
-            await safe_edit_text(status_msg, f"✅ **2FA updated for {info}.**", min_interval=0)
-            await send_premium(user_id, get_status_text(user_id), reply_markup=panel_keyboard(state))
-        else:
-            await safe_edit_text(status_msg, f"❌ {info}", min_interval=0)
         return
 
     if current_action == "delay":
@@ -482,7 +420,6 @@ async def user_text_handler(client, message):
             await temp_client.check_password(text)
             string_session = await temp_client.export_session_string()
             state["sessions"].append(string_session)
-            record_last_account(state, twofa=text, phone=login_data.get("phone"), has_2fa=True)
 
             await temp_client.disconnect()
             state["waiting_for"] = None
@@ -490,7 +427,7 @@ async def user_text_handler(client, message):
             await safe_edit_text(status_msg, "**Account added.**", min_interval=0)
             await _brand_and_join_on_add(user_id, string_session)
             await persist(user_id)
-            await send_premium(user_id, get_status_text(user_id), reply_markup=panel_keyboard(state))
+            await send_premium(user_id, get_status_text(user_id), reply_markup=kb)
         except Exception as e:
             logger.warning(f"[password_handler] 2FA failed for user {user_id}: {e}")
             try:

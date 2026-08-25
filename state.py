@@ -21,65 +21,12 @@ DEFAULT_STATE = lambda: {
     "delay":        15,
     "message":      "Your Custom Promo Message Here",
     "sessions":     [],
-    "accounts":     [],   # per-account metadata, index-aligned with "sessions"
     "sent_count":   0,
     "failed_count": 0,
     "waiting_for":  None,
     "login_data":   {},
     "schedules":    [],
 }
-
-
-def _default_account() -> dict:
-    return {
-        "twofa":    "",      # cloud password recorded at add-time ("" = no 2FA)
-        "has_2fa":  False,   # did the account have a cloud password at add-time
-        "username": None,
-        "user_id":  None,
-        "phone":    None,
-        "alert":    None,    # None | "removed" | "changed"
-    }
-
-
-def ensure_accounts(state: dict) -> list:
-    """Keep ``state['accounts']`` a list index-aligned with ``state['sessions']``."""
-    sessions = state.get("sessions", []) or []
-    accounts = state.get("accounts")
-    if not isinstance(accounts, list):
-        accounts = []
-    while len(accounts) < len(sessions):
-        accounts.append(_default_account())
-    if len(accounts) > len(sessions):
-        accounts = accounts[:len(sessions)]
-    state["accounts"] = accounts
-    return accounts
-
-
-def record_last_account(state: dict, *, twofa: str = "", phone: str | None = None, has_2fa: bool = False):
-    """Attach 2FA metadata to the most recently appended session."""
-    ensure_accounts(state)
-    if state["accounts"]:
-        state["accounts"][-1] = {
-            "twofa":    twofa or "",
-            "has_2fa":  has_2fa,
-            "username": None,
-            "user_id":  None,
-            "phone":    phone,
-            "alert":    None,
-        }
-
-
-def remove_account_at(state: dict, idx: int):
-    """Pop a session and its account metadata together, keeping them aligned."""
-    session = state["sessions"].pop(idx)
-    accounts = state.get("accounts")
-    if isinstance(accounts, list) and 0 <= idx < len(accounts):
-        accounts.pop(idx)
-    return session
-
-
-def has_2fa_alert(state: dict) -> bool:
-    return any(a.get("alert") for a in state.get("accounts", []) or [])
 
 
 def initialize_user_state(user_id: int) -> dict:
@@ -89,7 +36,6 @@ def initialize_user_state(user_id: int) -> dict:
     st.setdefault("schedules", [])
     st.setdefault("login_data", {})
     st.setdefault("waiting_for", None)
-    ensure_accounts(st)
     return st
 
 

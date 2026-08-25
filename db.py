@@ -26,7 +26,90 @@ async def init_db():
                 updated_at  TIMESTAMPTZ DEFAULT now()
             )
         """)
+        # Per-group ban memory: an account never targets this chat again.
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS group_bans (
+                account_id  BIGINT NOT NULL,
+                chat_id     BIGINT NOT NULL,
+                reason      TEXT,
+                banned_at   TIMESTAMPTZ DEFAULT now(),
+                PRIMARY KEY (account_id, chat_id)
+            )
+        """)
+        # Frozen / banned / auth-dead accounts pulled from rotation for good.
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS disabled_accounts (
+                account_id   BIGINT PRIMARY KEY,
+                reason       TEXT,
+                disabled_at  TIMESTAMPTZ DEFAULT now(),
+                notified     BOOLEAN NOT NULL DEFAULT FALSE
+            )
+        """)
     logger.info("[db] Connected to Neon Postgres.")
+
+
+async def load_ban_memory() -> tuple[set[tuple[int, int]], set[int], set[int]]:
+    """Return (banned_pairs, disabled_account_ids, notified_account_ids)."""
+    if not _pool:
+        return set(), set(), set()
+    try:
+        async with _pool.acquire() as conn:
+            ban_rows = await conn.fetch("SELECT account_id, chat_id FROM group_bans")
+            dis_rows = await conn.fetch("SELECT account_id, notified FROM disabled_accounts")
+    except Exception as e:
+        logger.warning(f"[db] load_ban_memory failed: {e}")
+        return set(), set(), set()
+    pairs = {(r["account_id"], r["chat_id"]) for r in ban_rows}
+    disabled = {r["account_id"] for r in dis_rows}
+    notified = {r["account_id"] for r in dis_rows if r["notified"]}
+    return pairs, disabled, notified
+
+
+async def add_group_ban(account_id: int, chat_id: int, reason: str):
+    if not _pool:
+        return
+    try:
+        async with _pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO group_bans (account_id, chat_id, reason)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (account_id, chat_id) DO NOTHING
+                """,
+                account_id, chat_id, reason,
+            )
+    except Exception as e:
+        logger.warning(f"[db] add_group_ban({account_id},{chat_id}) failed: {e}")
+
+
+async def add_disabled_account(account_id: int, reason: str):
+    if not _pool:
+        return
+    try:
+        async with _pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO disabled_accounts (account_id, reason)
+                VALUES ($1, $2)
+                ON CONFLICT (account_id) DO NOTHING
+                """,
+                account_id, reason,
+            )
+    except Exception as e:
+        logger.warning(f"[db] add_disabled_account({account_id}) failed: {e}")
+
+
+async def mark_notified(account_id: int):
+    if not _pool:
+        return
+    try:
+        async with _pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE disabled_accounts SET notified = TRUE WHERE account_id = $1",
+                account_id,
+            )
+    except Exception as e:
+        logger.warning(f"[db] mark_notified({account_id}) failed: {e}")
 
 
 def _sanitize(state: dict) -> dict:

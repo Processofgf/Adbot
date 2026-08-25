@@ -128,21 +128,6 @@ def cancel_keyboard() -> ReplyKeyboardMarkup:
     )
 
 
-def get_locked_keyboard() -> ReplyKeyboardMarkup:
-    """Restricted keyboard shown while an account has a pending 2FA alert."""
-    return ReplyKeyboardMarkup([
-        [styled_button(BTN_ADD_ACC,    "➕", "green"),
-         styled_button(BTN_REMOVE_ACC, "➖", "red")],
-    ], resize_keyboard=True, one_time_keyboard=False)
-
-
-def panel_keyboard(state: dict) -> ReplyKeyboardMarkup:
-    """Locked keyboard if any account is flagged, else the full panel."""
-    if any(a.get("alert") for a in state.get("accounts", []) or []):
-        return get_locked_keyboard()
-    return get_premium_keyboard(state.get("sending_mode", "NORMAL"))
-
-
 def remove_account_keyboard(count: int) -> ReplyKeyboardMarkup:
     rows = [
         [styled_button(f"Remove Profile {i+1}", "❌", "red")]
