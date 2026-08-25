@@ -48,6 +48,8 @@ def classify(err) -> Decision:
         return Decision(Action.BACKOFF, "flood_wait", wait or 10)
     if any(k in sig for k in SKIP):
         return Decision(Action.SKIP_GROUP, "banned_or_forbidden_in_chat")
-    if code in (401, 403):
+    if code == 401:                                          # UNAUTHORIZED = auth genuinely dead
         return Decision(Action.DISABLE_ACCT, "auth_dead")
+    if code == 403:                                          # FORBIDDEN = per-chat write block, NOT account death
+        return Decision(Action.SKIP_GROUP, "forbidden_in_chat")
     return Decision(Action.RETRY, "transient")
