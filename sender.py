@@ -11,90 +11,45 @@ from state import USER_STATES, RUNNING_TASKS, VEXORA_CHAT_IDS
 from ui import send_user_update
 from enforcer import enforce_account
 
-# How often (seconds) to re-run branding/join enforcement on an actively
-# broadcasting account's already-started client.
-ENFORCE_INTERVAL = 120  # 2 minutes
+# How often to re-run branding/join enforcement per account (seconds).
+ENFORCE_INTERVAL = 120
 
-# Tracks last enforcement time per (user_id, session_index) on THIS process.
 _LAST_ENFORCED: dict[tuple[int, int], float] = {}
 
 # ── FloodWait policy ────────────────────────────────────────────────────────
-# Telegram issues FloodWait for two distinct reasons:
-#   • Per-chat slowmode / send-rate limit  →  small, usually ≤ 30 s.
-#   • Account-level rate-limiting          →  large, 100–3600 s in the logs.
-#
-# Old behaviour: sleep the full wait inline, then retry the same chat up to 3×.
-# That burned up to ~15 minutes on one flooded account before moving on, and
-# re-flooded on the next chat too — producing the "sends a bit, dead 6 min,
-# repeat" pattern visible in the logs.
-#
-# New behaviour:
-#   • Small (≤ LARGE_FLOOD_THRESHOLD)  →  sleep + retry inline (unchanged).
-#     Handles per-chat slowmode correctly.
-#   • Large (>  LARGE_FLOOD_THRESHOLD) →  raise _AccountFloodWait immediately.
-#     broadcast_once catches this, records a per-account cooldown timestamp,
-#     advances the round cursor past the flooded chat, and moves on — no inline
-#     sleep, other accounts keep going.
+# ≤ LARGE_FLOOD_THRESHOLD  →  per-chat slowmode: sleep inline and retry once.
+# >  LARGE_FLOOD_THRESHOLD  →  account-level rate-limit: raise _AccountFloodWait.
+#    The account round ends immediately; no inline sleep; other accounts keep going.
 # ────────────────────────────────────────────────────────────────────────────
 LARGE_FLOOD_THRESHOLD = 30  # seconds
 
-# ── ADVANCED mode concurrency ────────────────────────────────────────────────
-# Old ADVANCED behaviour: gather() fired ALL group sends simultaneously → burst
-# → Telegram issued 250–325 s FloodWait on every account.
-#
-# New behaviour: tasks are still created concurrently (faster than NORMAL) but
-# launches are staggered so sends spread out over time.
-#
-#   stagger_delay = state["delay"] / ADVANCED_CONCURRENCY
-#
-# With delay=15 and ADVANCED_CONCURRENCY=5: one new task every 3 s, so
-# ADVANCED is 5× faster than NORMAL (which waits the full 15 s after each send)
-# while the per-account request rate stays inside Telegram's comfortable window.
-#
-# Adjust ADVANCED_CONCURRENCY higher for more speed / lower for more safety.
-ADVANCED_CONCURRENCY = 5   # parallel task "lanes" per account per round
-ADVANCED_MIN_STAGGER = 0.5 # floor: never launch two tasks faster than this
-
-# Per (user_id, session_index) → monotonic time when the account may resume.
+# Per (user_id, session_index) → monotonic timestamp when account may resume.
 _ACCOUNT_COOLDOWN: dict[tuple[int, int], float] = {}
 
-# ── Rotating round cursor ───────────────────────────────────────────────────
-# Without a cursor every round restarts at dialogs[0].  If that chat keeps
-# flooding, the round ends there every time and later chats are starved.
-#
-# _ROUND_CURSOR stores, per account, the dialog-list index where the *next*
-# round should begin.  On a large FloodWait the cursor advances past the
-# flooded chat so the next round starts with the chat immediately after it.
-# After a clean full round (no flood) all groups were served anyway, so the
-# cursor stays where it is — it will naturally advance again on the next flood.
-# ────────────────────────────────────────────────────────────────────────────
+# Per (user_id, session_index) → next-round starting index in the dialog list.
+# Prevents starvation when the first group keeps flooding.
 _ROUND_CURSOR: dict[tuple[int, int], int] = {}
 
 
 class _AccountFloodWait(Exception):
-    """Internal signal: Telegram returned a large (account-level) FloodWait.
-
-    Raised by send_to_group and caught by broadcast_once to end that account's
-    round cleanly without sleeping inline for hundreds of seconds.  The caller:
-      1. Records _ACCOUNT_COOLDOWN so the account is skipped on subsequent
-         rounds until Telegram's window expires.
-      2. Advances _ROUND_CURSOR past the flooded chat.
-      3. Moves on to the next account — no sleep here.
-    """
-
+    """Raised by send_to_group on a large (account-level) FloodWait.
+    Caught by _run_account_round to end that account's round without sleeping."""
     def __init__(self, wait_seconds: int):
         self.wait_seconds = wait_seconds
         super().__init__(f"AccountFloodWait({wait_seconds}s)")
 
 
+# ── Core send primitive ─────────────────────────────────────────────────────
+
 async def send_to_group(
     user_app, chat_id: int, message: str, state: dict, max_net_retries: int = 2
 ):
-    """Send one message to a chat with FloodWait + limited network-retry handling.
+    """Send one message to one chat.
 
-    Small FloodWait (≤ LARGE_FLOOD_THRESHOLD) is absorbed inline so per-chat
-    slowmode still gets honoured.  Large FloodWait raises _AccountFloodWait so
-    broadcast_once can end that account's round without a 100–3600 s inline sleep.
+    Small FloodWait  → sleep + retry (slowmode honoured).
+    Large FloodWait  → raise _AccountFloodWait (caller ends the round).
+    Network errors   → limited retries with exponential backoff.
+    Any other error  → log + increment failed_count + return.
     """
     net_attempt = 0
     while True:
@@ -106,263 +61,219 @@ async def send_to_group(
             return
         except FloodWait as e:
             wait = e.value
-            logger.info(f"[send_to_group] FloodWait {wait}s for chat {chat_id}")
+            logger.info(f"[send] FloodWait {wait}s  chat={chat_id}")
             if wait <= LARGE_FLOOD_THRESHOLD:
-                # Per-chat slowmode — absorb inline and retry once.
-                await asyncio.sleep(wait + 1)
+                await asyncio.sleep(wait + 1)   # per-chat slowmode — absorb inline
             else:
-                # Account-level rate-limit — signal caller to end this account's round.
-                raise _AccountFloodWait(wait)
+                raise _AccountFloodWait(wait)   # account rate-limited — bail out
         except (ConnectionError, TimeoutError, OSError) as e:
             net_attempt += 1
             if net_attempt > max_net_retries:
-                logger.warning(
-                    f"[send_to_group] Network error chat {chat_id} after {net_attempt} tries: {e}"
-                )
+                logger.warning(f"[send] network error chat={chat_id}: {e}")
                 state["failed_count"] += 1
                 return
-            backoff = 2 ** net_attempt
-            logger.debug(
-                f"[send_to_group] Network retry {net_attempt}/{max_net_retries} in {backoff}s: {e}"
-            )
-            await asyncio.sleep(backoff)
+            await asyncio.sleep(2 ** net_attempt)
         except RPCError as e:
-            logger.info(f"[send_to_group] RPC error chat {chat_id}: {e}")
+            logger.info(f"[send] RPC error chat={chat_id}: {e}")
             state["failed_count"] += 1
             return
         except Exception as e:
-            logger.error(f"[send_to_group] Unexpected error chat {chat_id}: {e}")
+            logger.error(f"[send] unexpected error chat={chat_id}: {e}")
             state["failed_count"] += 1
             return
 
 
-async def sleep_with_backoff(attempt: int, base: float = 5.0, cap: float = 300.0):
-    delay = min(base * (2 ** attempt), cap)
-    jitter = random.uniform(0, delay * 0.15)
-    await asyncio.sleep(delay + jitter)
+# ── Per-account round ───────────────────────────────────────────────────────
 
+async def _run_account_round(
+    user_id: int, index: int, session: str, state: dict, message: str
+) -> bool:
+    """Run one full send-round for a single account.
+
+    Connects the account, sends to every eligible group with state["delay"]
+    between each send, then disconnects.  Returns True if the account started.
+
+    This is the unit of work that ADVANCED mode runs in parallel across all
+    accounts.  The sequential per-group delay inside this function is what
+    keeps each account's send rate inside Telegram's comfortable window.
+
+    FloodWait handling
+    ------------------
+    Small waits  → absorbed by send_to_group (slowmode, per-chat limit).
+    Large waits  → _AccountFloodWait is caught here:
+                   • cooldown timestamp recorded for this account
+                   • round cursor advanced past the flooded chat
+                   • function returns; other parallel accounts unaffected
+
+    Starvation prevention
+    ---------------------
+    Dialogs are collected once and rotated by _ROUND_CURSOR so that a
+    repeatedly-flooding first chat doesn't starve later chats across rounds.
+    """
+    acc_key = (user_id, index)
+
+    # Skip if still cooling down from a previous large FloodWait.
+    cooldown_until = _ACCOUNT_COOLDOWN.get(acc_key, 0.0)
+    if time.monotonic() < cooldown_until:
+        remaining = int(cooldown_until - time.monotonic())
+        logger.info(f"[acc {index + 1}] cooling down ~{remaining}s — skipped.")
+        return False
+
+    started = False
+    user_app = Client(
+        f"User_{user_id}_Acc_{index}",
+        session_string=session,
+        api_id=API_ID,
+        api_hash=API_HASH,
+        in_memory=True,
+        no_updates=True,
+        device_model="PC 64bit",
+        system_version="Windows 11",
+        app_version="4.16.3",
+    )
+
+    try:
+        await user_app.start()
+        started = True
+
+        # Branding / join enforcement (rate-limited to ENFORCE_INTERVAL).
+        now = time.monotonic()
+        enforce_key = (user_id, index)
+        if now - _LAST_ENFORCED.get(enforce_key, 0) >= ENFORCE_INTERVAL:
+            try:
+                await enforce_account(user_app, do_join=True)
+            except Exception as e:
+                logger.warning(f"[acc {index + 1}] enforce failed: {e}")
+            finally:
+                _LAST_ENFORCED[enforce_key] = time.monotonic()
+
+        # Collect all eligible groups / supergroups for this account.
+        dialogs = []
+        async for dialog in user_app.get_dialogs():
+            if dialog.chat and dialog.chat.type.name in ["GROUP", "SUPERGROUP"]:
+                if dialog.chat.id not in VEXORA_CHAT_IDS:
+                    dialogs.append(dialog)
+
+        if dialogs:
+            n = len(dialogs)
+            cursor = _ROUND_CURSOR.get(acc_key, 0) % n
+            # Rotate so every round starts from where the last one left off.
+            ordered = dialogs[cursor:] + dialogs[:cursor]
+            chats_done = 0
+
+            for dialog in ordered:
+                # Pause: block here (don't drop the round) until resumed.
+                while state.get("status") == "PAUSED":
+                    await asyncio.sleep(1)
+                if state["status"] != "RUNNING":
+                    break
+
+                try:
+                    await send_to_group(user_app, dialog.chat.id, message, state)
+                    chats_done += 1
+                    await asyncio.sleep(state["delay"])   # configured inter-send gap
+                except _AccountFloodWait as fw:
+                    logger.warning(
+                        f"[acc {index + 1}] account-level FloodWait {fw.wait_seconds}s — "
+                        f"round ending, cooldown set."
+                    )
+                    _ACCOUNT_COOLDOWN[acc_key] = time.monotonic() + fw.wait_seconds + 2
+                    # Advance cursor past the flooded chat so the next round
+                    # starts with the chat after it, not the same flooded one.
+                    _ROUND_CURSOR[acc_key] = (cursor + chats_done + 1) % n
+                    break
+            # No flood → cursor stays; all groups were served this round.
+
+        return True
+
+    except (ConnectionError, TimeoutError, OSError) as e:
+        logger.error(f"[acc {index + 1}] network error: {e}")
+        await send_user_update(
+            user_id, f"⚠️ **Account {index + 1}:** Connection error. Please try again."
+        )
+        return False
+    except Exception as e:
+        logger.error(f"[acc {index + 1}] error: {e}")
+        await send_user_update(
+            user_id, f"⚠️ **Account {index + 1}:** Session expired or logged out."
+        )
+        return False
+    finally:
+        if started:
+            try:
+                await user_app.stop()
+            except Exception as e:
+                logger.debug(f"[acc {index + 1}] stop() error: {e}")
+
+
+# ── Broadcast orchestration ─────────────────────────────────────────────────
 
 async def broadcast_once(
     user_id: int, state: dict, message_override: str | None = None
 ) -> bool:
-    """Iterate every account once and send the promo message to all groups.
+    """Run one send-round across all accounts.
+
+    NORMAL mode
+    -----------
+    Accounts execute one after another (sequential).  Simple and predictable.
+
+    ADVANCED mode
+    -------------
+    ALL accounts run simultaneously via asyncio.gather — account 2 does not
+    wait for account 1 to finish.  Within each account, groups are still sent
+    sequentially with state["delay"] between sends so the per-account send rate
+    stays inside Telegram's comfortable window (no burst, no FloodWait).
 
     Returns True if at least one account started successfully.
-    Respects PAUSED (blocks) / STOPPED (early exit) status changes.
-
-    FloodWait handling
-    ------------------
-    Per-chat waits ≤ LARGE_FLOOD_THRESHOLD are absorbed inside send_to_group.
-    Larger waits are caught here as _AccountFloodWait:
-      • NORMAL mode: account's dialog loop ends immediately, _ACCOUNT_COOLDOWN
-        is set, cursor advances past the flooded chat.  No inline sleep.
-      • ADVANCED mode: per-task — the individual task silently skips that chat
-        and increments failed_count.  Other concurrent tasks keep running.
-      • Other accounts in the same round continue without interruption.
-
-    This also fixes the scheduler stall: broadcast_once now returns quickly
-    even when every account is rate-limited (no 300 s inline sleep).
-
-    ADVANCED mode — staggered sends (flood prevention)
-    ---------------------------------------------------
-    Old: gather() fired every group simultaneously → burst → Telegram issued
-    250–325 s FloodWait on every account.
-
-    New: tasks are created sequentially, each launch separated by
-    stagger_delay = delay / ADVANCED_CONCURRENCY.  Tasks then run concurrently
-    so ADVANCED is still ADVANCED_CONCURRENCY× faster than NORMAL, but
-    Telegram sees a steady drip rather than a burst.
-
-    Starvation prevention — both modes
-    ------------------------------------
-    _ROUND_CURSOR stores, per account, the dialog-list index where the next
-    round begins.  When a chat floods in NORMAL mode, the cursor moves past it
-    so the next round starts with the following chat.  ADVANCED mode also
-    collects and rotates dialogs, so it benefits from the same fairness.
     """
     message = message_override or state["message"]
     current_mode = state.get("sending_mode", "NORMAL")
-    had_success = False
+    sessions = list(state["sessions"])
 
-    for index, session in enumerate(list(state["sessions"])):
-        if state["status"] not in ("RUNNING", "PAUSED"):
-            break
-        while state.get("status") == "PAUSED":
-            await asyncio.sleep(1)
-        if state["status"] != "RUNNING":
-            break
+    if not sessions:
+        return False
 
-        # ── Account-level cooldown check ─────────────────────────────────────
-        acc_key = (user_id, index)
-        cooldown_until = _ACCOUNT_COOLDOWN.get(acc_key, 0.0)
-        if time.monotonic() < cooldown_until:
-            remaining = int(cooldown_until - time.monotonic())
-            logger.info(
-                f"[broadcast_once] acc {index + 1} cooling down for ~{remaining}s — skipping."
-            )
-            continue
+    # Honour pause / stop before starting.
+    while state.get("status") == "PAUSED":
+        await asyncio.sleep(1)
+    if state["status"] != "RUNNING":
+        return False
 
-        started = False
-        user_app = Client(
-            f"User_{user_id}_Acc_{index}",
-            session_string=session,
-            api_id=API_ID,
-            api_hash=API_HASH,
-            in_memory=True,
-            no_updates=True,
-            device_model="PC 64bit",
-            system_version="Windows 11",
-            app_version="4.16.3",
+    if current_mode == "ADVANCED":
+        # ── All accounts in parallel ──────────────────────────────────────────
+        # Each _run_account_round is an independent coroutine: account 1's delay
+        # sleep does NOT block account 2.  asyncio switches between them freely.
+        results = await asyncio.gather(
+            *[
+                _run_account_round(user_id, index, session, state, message)
+                for index, session in enumerate(sessions)
+            ],
+            return_exceptions=True,
         )
-        try:
-            await user_app.start()
-            started = True
-            had_success = True
+        return any(r is True for r in results)
 
-            # ── In-broadcast branding enforcement ────────────────────────────
-            # Re-run name/bio/channel enforcement every ENFORCE_INTERVAL seconds
-            # on this already-started client, catching accounts that left a
-            # Vexora channel or had profile changes while broadcasting.
-            enforce_key = (user_id, index)
-            now = time.monotonic()
-            if now - _LAST_ENFORCED.get(enforce_key, 0) >= ENFORCE_INTERVAL:
-                try:
-                    await enforce_account(user_app, do_join=True)
-                except Exception as e:
-                    logger.warning(
-                        f"[broadcast_once] pre-send enforce failed acc {index + 1}: {e}"
-                    )
-                finally:
-                    _LAST_ENFORCED[enforce_key] = now
+    else:
+        # ── Accounts one at a time (NORMAL) ───────────────────────────────────
+        had_success = False
+        for index, session in enumerate(sessions):
+            while state.get("status") == "PAUSED":
+                await asyncio.sleep(1)
+            if state["status"] != "RUNNING":
+                break
+            if await _run_account_round(user_id, index, session, state, message):
+                had_success = True
+        return had_success
 
-            if current_mode == "ADVANCED":
-                # ── Staggered-parallel (ADVANCED) mode ───────────────────────
-                # Collect eligible dialogs and apply the same rotating cursor as
-                # NORMAL mode so early-flooding chats don't starve later ones.
-                dialogs = []
-                async for dialog in user_app.get_dialogs():
-                    if dialog.chat and dialog.chat.type.name in ["GROUP", "SUPERGROUP"]:
-                        if dialog.chat.id not in VEXORA_CHAT_IDS:
-                            dialogs.append(dialog)
 
-                if dialogs:
-                    n = len(dialogs)
-                    cursor = _ROUND_CURSOR.get(acc_key, 0) % n
-                    ordered = dialogs[cursor:] + dialogs[:cursor]
+# ── Worker loops ────────────────────────────────────────────────────────────
 
-                    # stagger_delay spaces out task LAUNCHES so sends arrive at
-                    # Telegram as a steady stream, not a simultaneous burst.
-                    # = delay/ADVANCED_CONCURRENCY → ADVANCED_CONCURRENCY× faster
-                    #   than NORMAL mode, same total per-account message rate.
-                    stagger_delay = max(
-                        state["delay"] / ADVANCED_CONCURRENCY,
-                        ADVANCED_MIN_STAGGER,
-                    )
-
-                    # Inner coroutine: send + absorb per-task flood silently.
-                    # We don't set an account-level cooldown here because other
-                    # tasks for this account are already in flight — one flooded
-                    # chat should not abort the whole concurrent batch.
-                    async def _safe_send(chat_id: int):
-                        try:
-                            await send_to_group(user_app, chat_id, message, state)
-                        except _AccountFloodWait as fw:
-                            state["failed_count"] += 1
-                            logger.info(
-                                f"[advanced] acc {index + 1} chat {chat_id} "
-                                f"flood {fw.wait_seconds}s — skipping this chat."
-                            )
-
-                    launched: list[asyncio.Task] = []
-                    for dialog in ordered:
-                        if state["status"] != "RUNNING":
-                            # Cancel already-launched tasks cleanly.
-                            for t in launched:
-                                t.cancel()
-                            break
-                        launched.append(
-                            asyncio.create_task(_safe_send(dialog.chat.id))
-                        )
-                        # Stagger: yield to the event loop long enough for the
-                        # previous task to start its network call before we
-                        # queue the next one — spreading requests over time.
-                        await asyncio.sleep(stagger_delay)
-
-                    if launched:
-                        await asyncio.gather(*launched, return_exceptions=True)
-
-            else:
-                # ── Sequential (NORMAL) mode with rotating cursor ─────────────
-                # Collect all eligible dialogs first so we can slice from any
-                # offset without re-consuming the async generator.
-                dialogs = []
-                async for dialog in user_app.get_dialogs():
-                    if dialog.chat and dialog.chat.type.name in ["GROUP", "SUPERGROUP"]:
-                        if dialog.chat.id not in VEXORA_CHAT_IDS:
-                            dialogs.append(dialog)
-
-                if dialogs:
-                    n = len(dialogs)
-                    # Guard against stale cursors if the dialog count changed.
-                    cursor = _ROUND_CURSOR.get(acc_key, 0) % n
-                    # Rotate: start at cursor, wrap around to cover all dialogs.
-                    ordered = dialogs[cursor:] + dialogs[:cursor]
-                    chats_done = 0
-
-                    for dialog in ordered:
-                        if state["status"] != "RUNNING":
-                            break
-                        try:
-                            await send_to_group(
-                                user_app, dialog.chat.id, message, state
-                            )
-                            chats_done += 1
-                            await asyncio.sleep(state["delay"])
-                        except _AccountFloodWait as fw:
-                            logger.warning(
-                                f"[broadcast_once] acc {index + 1} account-level "
-                                f"FloodWait {fw.wait_seconds}s — "
-                                f"ending round, cooldown recorded."
-                            )
-                            # Record cooldown so next broadcast_once call skips
-                            # this account until Telegram's window is over.
-                            _ACCOUNT_COOLDOWN[acc_key] = (
-                                time.monotonic() + fw.wait_seconds + 2
-                            )
-                            # Advance past the flooded chat.
-                            # ordered[chats_done] is the flooded entry;
-                            # (cursor + chats_done + 1) % n is the chat after it.
-                            _ROUND_CURSOR[acc_key] = (cursor + chats_done + 1) % n
-                            break
-                    # If no flood occurred, cursor stays — all groups were served
-                    # and any starting point is equally good next round.
-
-        except (ConnectionError, TimeoutError, OSError) as e:
-            logger.error(f"[broadcast_once] Network error acc {index + 1}: {e}")
-            await send_user_update(
-                user_id,
-                f"⚠️ **Account {index + 1}:** Direct connection error. Please try again.",
-            )
-        except Exception as e:
-            logger.error(f"[broadcast_once] Account {index + 1} error: {e}")
-            await send_user_update(
-                user_id,
-                f"⚠️ **Account {index + 1}:** Session expired or logged out.",
-            )
-        finally:
-            if started:
-                try:
-                    await user_app.stop()
-                except Exception as e:
-                    logger.debug(
-                        f"[broadcast_once] stop() error acc {index + 1}: {e}"
-                    )
-
-    return had_success
+async def sleep_with_backoff(attempt: int, base: float = 5.0, cap: float = 300.0):
+    delay = min(base * (2 ** attempt), cap)
+    await asyncio.sleep(delay + random.uniform(0, delay * 0.15))
 
 
 async def dedicated_user_worker(user_id: int):
-    """Main loop for manual RUN. Keeps broadcasting until STOPPED."""
+    """Continuous broadcast loop for manual RUN until STOPPED."""
     consecutive_failures = 0
     try:
         while True:
@@ -389,47 +300,34 @@ async def dedicated_user_worker(user_id: int):
             if not had_success:
                 consecutive_failures += 1
                 logger.warning(
-                    f"[Worker] All accounts failed (attempt {consecutive_failures}). Backing off..."
+                    f"[Worker] All accounts failed (attempt {consecutive_failures})."
                 )
                 await sleep_with_backoff(consecutive_failures)
             else:
                 consecutive_failures = 0
-                if state.get("sending_mode", "NORMAL") == "ADVANCED":
-                    await asyncio.sleep(state["delay"])
-                else:
-                    await asyncio.sleep(2)
+                await asyncio.sleep(2)   # brief pause between full rounds
+
     except asyncio.CancelledError:
-        logger.info(f"[Worker] Task cancelled for user {user_id}")
+        logger.info(f"[Worker] Cancelled  user={user_id}")
     except Exception as e:
-        logger.error(
-            f"[Worker] Unhandled exception for user {user_id}: {e}", exc_info=True
-        )
+        logger.error(f"[Worker] Unhandled error  user={user_id}: {e}", exc_info=True)
     finally:
         RUNNING_TASKS.pop(user_id, None)
-        logger.info(f"[Worker] Task ended for user {user_id}")
+        logger.info(f"[Worker] Ended  user={user_id}")
 
 
 async def run_scheduled_broadcast(
     user_id: int, message_override: str | None = None
 ):
-    """One-shot broadcast triggered by the scheduler.
-
-    broadcast_once now returns quickly even when every account is flooded
-    (no inline sleep), so the scheduler's awaited call no longer stalls the
-    whole scheduled pass.
-    """
+    """One-shot broadcast triggered by the scheduler."""
     state = USER_STATES.get(user_id)
     if not state:
         return
     if state["status"] == "RUNNING":
-        logger.info(
-            f"[Scheduler] User {user_id} already RUNNING; skipping scheduled broadcast."
-        )
+        logger.info(f"[Scheduler] user={user_id} already RUNNING — skipped.")
         return
     if not state["sessions"]:
-        await send_user_update(
-            user_id, "⚠️ **Scheduled broadcast skipped:** No active accounts."
-        )
+        await send_user_update(user_id, "⚠️ **Scheduled broadcast skipped:** No active accounts.")
         return
 
     state["status"] = "RUNNING"
@@ -437,8 +335,6 @@ async def run_scheduled_broadcast(
     try:
         await broadcast_once(user_id, state, message_override=message_override)
     finally:
-        # If it wasn't stopped/paused manually mid-run, reset to STOPPED so the
-        # next schedule fires cleanly.
         if state["status"] == "RUNNING":
             state["status"] = "STOPPED"
     await send_user_update(user_id, "✅ **Scheduled broadcast finished.**")
