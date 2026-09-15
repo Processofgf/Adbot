@@ -21,6 +21,7 @@ DEFAULT_STATE = lambda: {
     "delay":        15,
     "message":      "Your Custom Promo Message Here",
     "sessions":     [],
+    "accounts":     [],   # index-aligned with sessions — stores twofa per account
     "sent_count":   0,
     "failed_count": 0,
     "waiting_for":  None,
@@ -29,11 +30,54 @@ DEFAULT_STATE = lambda: {
 }
 
 
+def _default_account() -> dict:
+    return {
+        "twofa":   "",     # cloud password entered at add-time ("" = no 2FA)
+        "has_2fa": False,  # whether account had 2FA when added
+        "phone":   None,
+    }
+
+
+def ensure_accounts(state: dict) -> list:
+    """Keep state['accounts'] a list index-aligned with state['sessions']."""
+    sessions = state.get("sessions", []) or []
+    accounts = state.get("accounts")
+    if not isinstance(accounts, list):
+        accounts = []
+    while len(accounts) < len(sessions):
+        accounts.append(_default_account())
+    if len(accounts) > len(sessions):
+        accounts = accounts[:len(sessions)]
+    state["accounts"] = accounts
+    return accounts
+
+
+def record_last_account(state: dict, *, twofa: str = "", phone: str | None = None, has_2fa: bool = False):
+    """Save 2FA metadata for the most recently appended session."""
+    ensure_accounts(state)
+    if state["accounts"]:
+        state["accounts"][-1] = {
+            "twofa":   twofa or "",
+            "has_2fa": has_2fa,
+            "phone":   phone,
+        }
+
+
+def remove_account_at(state: dict, idx: int) -> str:
+    """Pop a session and its metadata together, keeping lists aligned."""
+    session = state["sessions"].pop(idx)
+    accounts = state.get("accounts")
+    if isinstance(accounts, list) and 0 <= idx < len(accounts):
+        accounts.pop(idx)
+    return session
+
+
 def initialize_user_state(user_id: int) -> dict:
     if user_id not in USER_STATES:
         USER_STATES[user_id] = DEFAULT_STATE()
     st = USER_STATES[user_id]
     st.setdefault("schedules", [])
+    ensure_accounts(st)   # keep accounts aligned whenever state is touched
     st.setdefault("login_data", {})
     st.setdefault("waiting_for", None)
     return st

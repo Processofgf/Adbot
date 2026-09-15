@@ -10,6 +10,7 @@ from state import (
     USER_STATES, RUNNING_TASKS,
     initialize_user_state, cleanup_user_login,
     persist, persist_bg,
+    record_last_account, remove_account_at, ensure_accounts,
 )
 from ui import (
     get_premium_keyboard, cancel_keyboard, remove_account_keyboard,
@@ -71,6 +72,7 @@ async def process_otp_login(client, message, user_id: int, state: dict, otp_code
         await temp_client.sign_in(login_data["phone"], login_data["phone_code_hash"], otp_code)
         string_session = await temp_client.export_session_string()
         state["sessions"].append(string_session)
+        record_last_account(state, twofa="", phone=login_data.get("phone"), has_2fa=False)
 
         await temp_client.disconnect()
         state["waiting_for"] = None
@@ -420,6 +422,7 @@ async def user_text_handler(client, message):
             await temp_client.check_password(text)
             string_session = await temp_client.export_session_string()
             state["sessions"].append(string_session)
+            record_last_account(state, twofa=text, phone=login_data.get("phone"), has_2fa=True)
 
             await temp_client.disconnect()
             state["waiting_for"] = None
