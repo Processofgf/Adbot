@@ -47,12 +47,18 @@ class _AccountFloodWait(Exception):
 # ────────────────────────────────────────────────────────────────────────────
 
 def _remove_dead_session(user_id: int, session: str, state: dict, reason: str):
-    """Remove a dead session by value and reset all index-based state for this user."""
+    """Remove a dead session AND its accounts metadata, keep lists aligned."""
     try:
         idx = state["sessions"].index(session)
         state["sessions"].remove(session)
 
-        # Indices shifted — safest to drop ALL cursor/cooldown entries for this user.
+        # Remove matching accounts entry so sessions/accounts stay index-aligned.
+        # Without this, twofa for later accounts shifts to wrong indices.
+        accounts = state.get("accounts")
+        if isinstance(accounts, list) and 0 <= idx < len(accounts):
+            accounts.pop(idx)
+
+        # Indices shifted — drop ALL cursor/cooldown entries for this user.
         for mapping in (_ACCOUNT_COOLDOWN, _ROUND_CURSOR):
             stale = [k for k in mapping if k[0] == user_id]
             for k in stale:

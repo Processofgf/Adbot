@@ -306,7 +306,7 @@ async def user_text_handler(client, message):
         try:
             idx = int(text.split(" ")[2]) - 1
             if 0 <= idx < len(state["sessions"]):
-                session_string = state["sessions"].pop(idx)
+                session_string = remove_account_at(state, idx)  # removes from sessions AND accounts
                 await persist(user_id)
                 # Best-effort remote logout in background so the panel stays snappy.
                 asyncio.create_task(logout_session(user_id, session_string))
